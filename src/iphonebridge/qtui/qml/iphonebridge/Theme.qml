@@ -6,14 +6,19 @@ import QtQuick
 QtObject {
     property bool dark: true
 
+    // Frosted-glass look (translucent surfaces over KWin blur). Off by
+    // default: without working blur the desktop shows straight through and
+    // text is barely readable. Flip to true on a setup where blur engages.
+    readonly property bool glass: false
+
     // Bubbles are translucent so KWin's blur behind the window frosts
     // through them, rather than sitting on them as flat colour.
     // Outgoing alpha is the frost knob: at 0.82 the gradient was effectively
     // opaque and KWin's blur never showed through. ~0.5 lets it read as glass
     // while keeping white body text legible against a light backdrop.
-    readonly property color bubbleOutTop:  Qt.rgba(0.21, 0.64, 1.00, 0.52)
-    readonly property color bubbleOutBot:  Qt.rgba(0.02, 0.46, 0.94, 0.52)
-    readonly property color bubbleIn:      dark ? Qt.rgba(0.42, 0.42, 0.46, 0.34)
+    readonly property color bubbleOutTop:  Qt.rgba(0.21, 0.64, 1.00, glass ? 0.52 : 1.0)
+    readonly property color bubbleOutBot:  Qt.rgba(0.02, 0.46, 0.94, glass ? 0.52 : 1.0)
+    readonly property color bubbleIn:      dark ? Qt.rgba(0.30, 0.30, 0.33, glass ? 0.34 : 1.0)
                                                : Qt.rgba(1, 1, 1, 0.55)
     readonly property color bubbleInText:  dark ? "#ffffff" : "#000000"
     // Faint top-edge highlight — what sells glass over plain transparency.
@@ -22,12 +27,12 @@ QtObject {
 
     // Alphas are deliberately low: KWin blurs whatever is behind the
     // window, and these tints sit on top of that frosted result.
-    readonly property color sidebarBg:     dark ? Qt.rgba(0.16, 0.16, 0.18, 0.42)
-                                               : Qt.rgba(1, 1, 1, 0.45)
-    readonly property color chromeBg:      dark ? Qt.rgba(0.11, 0.11, 0.12, 0.35)
-                                               : Qt.rgba(1, 1, 1, 0.40)
-    readonly property color pageBg:        dark ? Qt.rgba(0.07, 0.07, 0.08, 0.30)
-                                               : Qt.rgba(0.97, 0.97, 0.98, 0.35)
+    readonly property color sidebarBg:     dark ? Qt.rgba(0.16, 0.16, 0.18, glass ? 0.42 : 1.0)
+                                               : Qt.rgba(0.95, 0.95, 0.97, glass ? 0.45 : 1.0)
+    readonly property color chromeBg:      dark ? Qt.rgba(0.11, 0.11, 0.12, glass ? 0.35 : 1.0)
+                                               : Qt.rgba(1, 1, 1, glass ? 0.40 : 1.0)
+    readonly property color pageBg:        dark ? Qt.rgba(0.07, 0.07, 0.08, glass ? 0.30 : 1.0)
+                                               : Qt.rgba(0.97, 0.97, 0.98, glass ? 0.35 : 1.0)
     // Same hue at full alpha — gradients must fade from an opaque stop,
     // otherwise the "solid" end is already see-through.
     readonly property color pageBgSolid:   dark ? Qt.rgba(0.08, 0.08, 0.09, 1.0)

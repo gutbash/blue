@@ -113,8 +113,9 @@ class HfpManager:
     # ---- lifecycle ------------------------------------------------------
 
     def start(self) -> None:
-        mgr = dbus.Interface(system_bus.get_object(OFONO, "/"), _MGR_IFACE)
         try:
+            # get_object() itself raises ServiceUnknown when oFono isn't installed.
+            mgr = dbus.Interface(system_bus.get_object(OFONO, "/"), _MGR_IFACE)
             modems = mgr.GetModems()
         except dbus.exceptions.DBusException as e:
             log.warning(
