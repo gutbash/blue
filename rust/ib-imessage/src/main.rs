@@ -211,8 +211,108 @@
 //!
 //! `rename` -> `{"guid","chat_guid"}`: `{"cmd":"rename","chat":{...},"name":"New"}`
 //!
+//! `send_poll` -> `{"guid","chat_guid","option_ids":["<UUID>",…],"session":"<UUID>"}`
+//!
+//!     {"cmd":"send_poll","chat":{...},"question":"Site visit day?",
+//!      "options":["Tue","Wed","Thu"]}
+//!
+//! At least two non-empty options. `question` (default `""`) goes in the
+//! payload's `item.title`, as the sbaresearch fork sends it; no separate
+//! caption message is sent. `option_ids` are in `options` order. The poll is
+//! registered so later `poll_vote` events on it carry option text. Wire
+//! shape: a Polls extension balloon (`requiredCapabilities` =
+//! `["supports-polls"]`, `sendAsText`, the Polls icon, breadcrumb and xml
+//! "Sent a poll"). [VERIFY on a device: ported, not yet sent live]
+//!
+//! `poll_vote` -> `{"guid","chat_guid"}`
+//!
+//!     {"cmd":"poll_vote","chat":{...},"poll_guid":"<guid>",
+//!      "option_ids":["<UUID>",…],"session":"<UUID, optional>"}
+//!
+//! Sets our *whole* selection; `[]` withdraws. Sent as a `React` with
+//! `Extension { is_meta: true }` (associated type 4000) on `poll_guid`.
+//! `session` is the poll's balloon session; omit it for a poll sent or
+//! received since the helper started. Ids not on a known poll are rejected.
+//! [VERIFY on a device]
+//!
+//! **Adding a poll option is not a command yet.** `poll::extend_payload`
+//! builds the extended payload and matches the captured iPhone add-option
+//! payload exactly, apart from the new UUID. The update's *envelope* is not
+//! established: the capture logged no associated type (2 or 4000), layout,
+//! icon, capabilities, body or part, and the sbaresearch fork has no update
+//! sender. Every extension balloon now also logs `extension envelope on …`
+//! with those fields; one captured add-option from an iPhone settles it.
+//!
 //! `set_participants` -> `{"guid","chat_guid"}`:
 //! `{"cmd":"set_participants","chat":{...},"participants":[...],"group_version":0}`
+//!
+//! `send_link` -> `{"guid","chat_guid","card":bool,"card_note"|"card_error":"…"|null}`
+//!
+//!     {"cmd":"send_link","chat":{...},"url":"https://atlas.phila.gov/…",
+//!      "title":"Optional","summary":"Optional","site_name":"Optional",
+//!      "image_path":"C:\\abs\\card.jpg","fetch":true}
+//!
+//! Sends a rich link card: rustpush's `NormalMessage.link_meta`, which goes
+//! out as a `com.apple.messages.URLBalloonProvider` balloon carrying an
+//! `LPLinkMetadata`, with the image inline in the balloon (no MMCS). The text
+//! body is the URL. `url` must be absolute http(s). `image_path`: JPEG or PNG.
+//! With `fetch` (default true), a missing title or image is filled from the
+//! page's OpenGraph tags (`og:title`, `og:description`, `og:site_name`,
+//! `og:image`; fallback `<title>` and `description`): 5 s timeout per
+//! request, 512 KB of HTML, 2 MB of image. Given fields always win.
+//! **Fallback:** with no title and no image, or if the card send fails, the
+//! URL goes as plain text and `card` is false, with the reason in
+//! `card_error`. A card that failed after reaching some devices can arrive
+//! next to the plain one. `site_name` is the `siteName` key, added to the
+//! vendored struct. [VERIFY on a device that iOS renders our card]
+//!
+//! `download_link_image` -> `{"path","bytes","mime"}`:
+//! `{"cmd":"download_link_image","guid":"<link msg guid>","dest":"C:\\abs\\o.jpg"}`.
+//! The newest 64 received link images are cached.
+//!
+//! `focus_status` -> `{"statuses":[{"handle","shared":bool,"subscribed":bool,
+//!   "known":bool,"focused":bool|null,"mode":"…"|null,"allowed":bool|null,
+//!   "at":"<RFC 3339>"|null,"at_epoch":…,"observed_at":…}],"sharers":[…]}`
+//!
+//!     {"cmd":"focus_status","handles":["tel:+12155550100"]}   // [] = every sharer
+//!
+//! Needs `--focus`; otherwise `ok:false` with the reason (also in
+//! `status.focus`). Read-only: the helper never publishes a Focus status.
+//! A handle has a status only if that person's device shared its Focus
+//! key with us (`shared`). We cannot ask for it. Every sharer is subscribed
+//! automatically. `known` turns true when their channel delivers a status.
+//! `focused` is the opposite of StatusKit's `active` flag. `mode` is the
+//! Focus mode id. `allowed` means our messages would still notify them.
+//! `at` is when their device created the status: the "since when".
+//! Statuses are in memory only and are re-delivered after a restart.
+//! See `focus.rs`.
+//!
+//! **`--focus` and the registration.** Receiving needs the IDS service
+//! `com.apple.private.alloy.multiplex1`. The registration includes it, but
+//! rustpush re-registers any service whose stored `data_hash` differs from
+//! its own, and this build cannot re-register. `--focus` is refused at
+//! startup unless the hashes match. On the firm's registration as of
+//! 2026-10-28 they do not (stored 13329886844215203963, this build
+//! 10279869897339162389), so `--focus` is refused there today.
+//!
+//! `set_background` -> `{"guid","chat_guid","version":n,"cleared":bool,"poster":"photo|…"|null}`
+//!
+//!     {"cmd":"set_background","chat":{...,"guid":"<chat guid>"},"path":"C:\\abs\\bg.zip"}
+//!     {"cmd":"set_background","chat":{...,"guid":"<chat guid>"},"version":4}
+//!
+//! IDS command 138, `Message::SetTranscriptBackground`. Without `path` the
+//! background is cleared. With `path` the file is uploaded to MMCS, as
+//! `set_icon` does, and sent as the new background. **The file must be a
+//! transcript-background payload, not an image.** iOS's is a zip of a
+//! PosterKit archive plus a watch preview, and `.jpg`/`.png`/`.heic`/`.gif`
+//! are refused. Use a payload saved with `download_background`. `cid` is
+//! set to `chat.guid`. `version` (`tbid`) defaults to one past the newest
+//! seen or sent for that chat, else 1. [VERIFY both on a device]
+//!
+//! `download_background` -> `{"path","bytes","preview":"<path>"|null,"poster":"…"|null}`:
+//! `{"cmd":"download_background","guid":"<background msg guid>","dest":"C:\\abs\\bg.zip"}`.
+//! Writes the payload, plus its watch preview image beside it as
+//! `<dest>.preview.<ext>`.
 //!
 //! ### Events (no `id` unless stated)
 //!
@@ -266,16 +366,16 @@
 //! `total` is MMCS's count and includes encryption overhead, so it can differ
 //! slightly from the file size. Advisory only: the reply is the result.
 //!
-//! **Native polls (iOS 26), inbound only.** A poll arrives as an ordinary
+//! **Native polls (iOS 26).** A poll arrives as an ordinary
 //! `message` event whose `Message.app.bundle_id` ends in
 //! `com.apple.messages.Polls`; a vote arrives as a `React` with an
 //! `Extension` reaction (associated type 4000) whose `to_uuid` is the poll.
 //! The raw `message` event is always sent; these follow it:
 //!
-//!     {"event":"poll","guid":"<poll message guid>","chat":<ConversationData>|null,
+//!     {"event":"poll","guid":"<poll message guid>","sender":"<handle>"|null,"chat":<ConversationData>|null,
 //!      "question":"…","creator":"<handle>"|null,
 //!      "options":["…",…],"option_ids":["<UUID>",…]}
-//!     {"event":"poll_vote","poll_guid":"<guid>","chat":…,"voter":"<handle>"|null,
+//!     {"event":"poll_vote","poll_guid":"<guid>","sender":"<handle>"|null,"chat":…,"voter":"<handle>"|null,
 //!      "option":"<text, or the option id if the poll is unknown>",
 //!      "option_id":"<UUID>","option_known":bool,
 //!      "selected":[{"option_id":"<UUID>","option":"…"|null},…]}
@@ -290,6 +390,11 @@
 //!   `option`/`option_id` null and `selected: []`. [VERIFY on a device]
 //! - Option texts are remembered only for polls seen since the helper
 //!   started; votes on older polls carry `option_known: false`.
+//! - `sender` (on both events) is `inst.sender`: the handle Apple delivered
+//!   and verified (`tel:+1…` / `mailto:…`), or null if the envelope had none.
+//!   It is never read from the payload. `creator` and `voter` come from the
+//!   payload (`creatorHandle`, `participantHandle`) and **any chat member can
+//!   forge them**; authorise on `sender`, not on those.
 //! - Handles inside the poll payload (`creator`, `voter`) are as iOS writes
 //!   them (`+1…` or an email), without the `tel:`/`mailto:` prefix.
 //! - A type-2 update that carries the option list (an option was added) is
@@ -297,8 +402,33 @@
 //! - rustpush does not serialise `ExtensionApp.balloon`, so the poll URL is
 //!   *not* in `inst`. Every extension balloon is logged at info level as
 //!   `extension balloon on <guid> … bid=… url=…` for capture and debugging.
-//! There is no `send_poll`: the outbound wire format is not confirmed.
+//! - The balloon session id of every poll seen is remembered, for `poll_vote`.
 //! Format and sources: `src/poll.rs`.
+//!
+//! **Rich links.** After the raw `message` event, a message with
+//! `Message.link_meta` emits:
+//!
+//!     {"event":"link","guid","sender":"<handle>"|null,"chat":<ConversationData>|null,
+//!      "url","original_url","title","summary","site_name",
+//!      "image":{"mime","index","bytes","available":bool,"size":"{w, h}"|null,
+//!               "source_url"|null}|null}
+//!
+//! `sender` is `inst.sender`, Apple-verified. Everything else is the
+//! sender's own claim about the page. Fetch the image with
+//! `download_link_image`.
+//!
+//! **Focus** (`--focus` only):
+//! `{"event":"focus","handle","focused":bool,"mode","allowed","at","at_epoch","observed_at"}`
+//! on each status a sharer publishes, and `{"event":"focus_shared","handle"}`
+//! when someone first shares their Focus key with us. `handle` is the IDS
+//! sender of the key-sharing message, which Apple delivers and verifies.
+//!
+//! **Backgrounds:** `{"event":"background","guid","chat":"<cid>"|null,
+//! "sender","cleared":bool,"version":n,"background_id"?,"payload_version"?,
+//! "bytes"?}`. rustpush delivers this with no conversation, so `inst.
+//! conversation` is null and `chat` is the payload's `cid`, which is
+//! assumed but not verified to be the chat guid. `sender` is `inst.sender`.
+//! `version` is `tbid`, the background's sequence number.
 //!
 //! `{"event":"parse_error","error":"<rustpush error>"}` — an APNs message that
 //! rustpush could not parse.
@@ -319,6 +449,9 @@
 //! `SINGLETON_NOTE` below.
 
 mod compose;
+mod background;
+mod focus;
+mod link;
 mod migrate;
 mod poll;
 mod profile;
@@ -524,6 +657,57 @@ enum Command {
         chat: ChatRef,
         name: String,
     },
+    /// Send a native iOS 26 poll. See `poll.rs`.
+    SendPoll {
+        chat: ChatRef,
+        #[serde(default)]
+        question: String,
+        options: Vec<String>,
+    },
+    /// Set our whole selection on a poll; an empty list withdraws.
+    PollVote {
+        chat: ChatRef,
+        poll_guid: String,
+        option_ids: Vec<String>,
+        /// The poll's balloon session id. Optional when the poll was sent or
+        /// received since this helper started.
+        #[serde(default)]
+        session: Option<String>,
+    },
+    /// Send a URL as a rich link card; see `link.rs`.
+    SendLink {
+        chat: ChatRef,
+        url: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        site_name: Option<String>,
+        /// Local JPEG or PNG for the card image.
+        #[serde(default)]
+        image_path: Option<String>,
+        /// Fetch the page's OpenGraph tags to fill a missing title or image.
+        #[serde(default = "yes")]
+        fetch: bool,
+    },
+    /// Write the preview image of a received link card to a file.
+    DownloadLinkImage { guid: String, dest: String },
+    /// Shared Focus state of the given handles (all sharers if empty).
+    FocusStatus {
+        #[serde(default)]
+        handles: Vec<String>,
+    },
+    /// Set (`path`) or clear (no `path`) a chat background.
+    SetBackground {
+        chat: ChatRef,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        version: Option<u64>,
+    },
+    /// Fetch a received background's payload (and its preview image).
+    DownloadBackground { guid: String, dest: String },
     /// Replaces the participant list wholesale, which is how iMessage models
     /// both adding and removing.
     SetParticipants {
@@ -666,6 +850,10 @@ struct Session {
     profile_name: String,
     /// Conversations that already got the profile, for `--share-profile first`.
     profile_sent: Mutex<profile::Sent>,
+    /// StatusKit receiver, with `--focus` only; see `focus.rs`.
+    focus: Option<Arc<focus::Focus>>,
+    /// Why Focus is off, for `status` and `focus_status` errors.
+    focus_note: String,
 }
 
 impl Session {
@@ -724,6 +912,7 @@ impl Session {
                     "source": prof.as_ref().and_then(|p| p.2.clone()),
                     "share": self.share_mode.as_str(),
                 },
+                "focus": { "enabled": self.focus.is_some(), "note": self.focus_note },
             }))
             }
             Command::Handles => Ok(json!({ "handles": self.handles })),
@@ -843,6 +1032,32 @@ impl Session {
                     embedded_profile: None,
                 };
                 self.send(chat, Message::React(react)).await
+            }
+
+            Command::SendPoll { chat, question, options } => {
+                let built = poll::build_poll(self.my_handle()?, &question, &options)?;
+                let mut reply = self.send(chat, Message::Message(built.message)).await?;
+                let guid = reply["guid"].as_str().unwrap_or_default().to_string();
+                let ids: Vec<String> = built.options.iter().map(|(i, _)| i.clone()).collect();
+                poll::register_sent(&guid, &built.session, built.options, built.payload);
+                reply["option_ids"] = json!(ids);
+                reply["session"] = json!(built.session);
+                Ok(reply)
+            }
+
+            Command::PollVote { chat, poll_guid, option_ids, session } => {
+                let session = session
+                    .or_else(|| poll::session_of(&poll_guid))
+                    .ok_or_else(|| anyhow!(
+                        "poll {poll_guid} has not been seen since the helper started; pass `session`"
+                    ))?;
+                if let Some(known) = poll::option_ids_of(&poll_guid) {
+                    if let Some(bad) = option_ids.iter().find(|i| !known.contains(i)) {
+                        bail!("option {bad} is not on poll {poll_guid}");
+                    }
+                }
+                let vote = poll::build_vote(&poll_guid, &session, self.my_handle()?, &option_ids)?;
+                self.send(chat, Message::React(vote)).await
             }
 
             Command::Edit {
@@ -998,6 +1213,97 @@ impl Session {
                 Ok(json!({ "path": dest, "bytes": size }))
             }
 
+            Command::SendLink { chat, url, title, summary, site_name, image_path, fetch } => {
+                link::check_url(&url)?;
+                let (card, card_err) = self
+                    .build_link(&url, title, summary, site_name, image_path, fetch)
+                    .await;
+                let profile = self.profile_for(&chat).await;
+                if let Some(mut m) = card {
+                    m.embedded_profile = profile.clone();
+                    match self.send(chat.clone(), Message::Message(m)).await {
+                        Ok(mut r) => {
+                            r["card"] = json!(true);
+                            r["card_note"] = json!(card_err);
+                            return Ok(r);
+                        }
+                        Err(e) => {
+                            // A failed card send is retried as plain text. If the
+                            // card had reached some devices, they see the URL twice.
+                            log::warn!("link card send failed, sending plain URL: {e:#}");
+                            let mut plain = link::plain(&url);
+                            plain.embedded_profile = profile;
+                            let mut r = self.send(chat, Message::Message(plain)).await?;
+                            r["card"] = json!(false);
+                            r["card_error"] = json!(format!("{e:#}"));
+                            return Ok(r);
+                        }
+                    }
+                }
+                let mut plain = link::plain(&url);
+                plain.embedded_profile = profile;
+                let mut r = self.send(chat, Message::Message(plain)).await?;
+                r["card"] = json!(false);
+                r["card_error"] = json!(card_err);
+                Ok(r)
+            }
+
+            Command::DownloadLinkImage { guid, dest } => {
+                let (mime, bytes) = link::image_of(&guid).ok_or_else(|| {
+                    anyhow!("no link preview image cached for {guid}; it is older than the helper, evicted, or had none")
+                })?;
+                write_atomic(&PathBuf::from(&dest), &bytes)?;
+                Ok(json!({ "path": dest, "bytes": bytes.len(), "mime": mime }))
+            }
+
+            Command::FocusStatus { handles } => {
+                let Some(f) = &self.focus else {
+                    bail!("Focus status is off: {}", self.focus_note);
+                };
+                let handles = if handles.is_empty() { f.sharers().await } else { handles };
+                Ok(f.query(&handles).await)
+            }
+
+            Command::SetBackground { chat, path, version } => {
+                // `cid` = the chat guid. [VERIFY that iOS keys it the same way]
+                let chat_id = chat.guid.clone();
+                let version = background::next_version(chat_id.as_deref(), version);
+                let (file, kind) = match &path {
+                    None => (None, None),
+                    Some(p) => {
+                        let kind = background::validate_payload(p)?;
+                        let f = self
+                            .upload_mmcs(id.as_deref(), 0, 1, p)
+                            .await
+                            .with_context(|| format!("uploading background {p}"))?;
+                        (Some(f), Some(kind))
+                    }
+                };
+                let msg = background::build(file, version, chat_id.clone());
+                let mut r = self.send(chat, Message::SetTranscriptBackground(msg)).await?;
+                background::note_version(chat_id.as_deref(), version);
+                r["version"] = json!(version);
+                r["cleared"] = json!(path.is_none());
+                r["poster"] = json!(kind);
+                Ok(r)
+            }
+
+            Command::DownloadBackground { guid, dest } => {
+                let msg = background::recent(&guid).ok_or_else(|| {
+                    anyhow!("no background set cached for {guid}; it is older than the helper or was a clear")
+                })?;
+                let mmcs = msg.to_mmcs().ok_or_else(|| anyhow!("{guid} cleared the background; nothing to download"))?;
+                let mut buf = std::io::Cursor::new(Vec::new());
+                mmcs.get_attachment(&self.conn, &mut buf, |_, _| {})
+                    .await
+                    .map_err(|e| anyhow!("downloading background from MMCS: {e}"))?;
+                let bytes = buf.into_inner();
+                let path = PathBuf::from(&dest);
+                write_atomic(&path, &bytes)?;
+                let (preview, kind) = background::extract_preview(&bytes, &path);
+                Ok(json!({ "path": dest, "bytes": bytes.len(), "preview": preview, "poster": kind }))
+            }
+
             Command::SetParticipants {
                 chat,
                 participants,
@@ -1100,6 +1406,52 @@ impl Session {
             display_name: Some(self.profile_name.clone()),
             source: Some(source.to_string()),
         });
+    }
+
+    /// The link card for `send_link`, or None plus the reason it could not
+    /// be built. Given fields win; OpenGraph fills only what is missing.
+    async fn build_link(
+        &self,
+        url: &str,
+        title: Option<String>,
+        summary: Option<String>,
+        site_name: Option<String>,
+        image_path: Option<String>,
+        fetch: bool,
+    ) -> (Option<NormalMessage>, Option<String>) {
+        let mut notes = Vec::new();
+        let mut card = link::Card { title, summary, site_name, image_url: None };
+        let mut image = None;
+        if let Some(p) = &image_path {
+            match std::fs::read(p).map_err(anyhow::Error::from).and_then(|b| link::CardImage::from_bytes(b, None)) {
+                Ok(i) => image = Some(i),
+                Err(e) => notes.push(format!("image {p}: {e:#}")),
+            }
+        }
+        if fetch && (card.title.is_none() || image.is_none()) {
+            match link::fetch(url).await {
+                Ok((og, og_image)) => {
+                    card.title = card.title.or(og.title);
+                    card.summary = card.summary.or(og.summary);
+                    card.site_name = card.site_name.or(og.site_name);
+                    card.image_url = og.image_url.clone();
+                    if image.is_none() {
+                        if let Some(b) = og_image {
+                            match link::CardImage::from_bytes(b, og.image_url) {
+                                Ok(i) => image = Some(i),
+                                Err(e) => notes.push(format!("og:image: {e:#}")),
+                            }
+                        }
+                    }
+                }
+                Err(e) => notes.push(format!("fetch: {e:#}")),
+            }
+        }
+        let note = (!notes.is_empty()).then(|| notes.join("; "));
+        if card.title.is_none() && image.is_none() {
+            return (None, Some(note.unwrap_or_else(|| "no title or image to show".into())));
+        }
+        (Some(link::build(url, &card, image)), note)
     }
 
     /// A `Read` receipt. iMessage matches a read receipt to a message by the
@@ -1285,6 +1637,16 @@ impl Session {
     }
 }
 
+/// Write through a temp file and rename, as `download_attachment` does.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("part");
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
+}
+
 // ---------------------------------------------------------------------------
 // event pump
 // ---------------------------------------------------------------------------
@@ -1332,6 +1694,9 @@ async fn pump(session: Arc<Session>, conn: rustpush::APSConnection) {
                 std::process::exit(1);
             }
         };
+        if let Some(f) = &session.focus {
+            f.handle(aps.clone(), session.events.clone());
+        }
         match session.client.handle(aps).await {
             Ok(Some(inst)) => {
                 if session.delivery_receipts {
@@ -1376,6 +1741,14 @@ fn publish(session: &Session, inst: MessageInst) {
             // Derived events follow the raw one; see poll.rs.
             for ev in poll::events_for(&inst) {
                 log::info!("poll event: {ev}");
+                let _ = session.events.send(ev.to_string());
+            }
+            if let Some(ev) = link::event_for(&inst) {
+                log::info!("link event on {}", inst.id);
+                let _ = session.events.send(ev.to_string());
+            }
+            if let Some(ev) = background::event_for(&inst) {
+                log::info!("background event: {ev}");
                 let _ = session.events.send(ev.to_string());
             }
         }
@@ -1542,6 +1915,8 @@ struct Args {
     share_profile: profile::ShareMode,
     delivery_receipts: bool,
     profile_name: String,
+    /// Receive shared Focus status (read-only); see focus.rs.
+    focus: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -1554,6 +1929,7 @@ fn parse_args() -> Result<Args> {
     let mut share_profile = profile::ShareMode::Never;
     let mut delivery_receipts = true;
     let mut profile_name = "Group G".to_string();
+    let mut focus = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1571,6 +1947,7 @@ fn parse_args() -> Result<Args> {
                 )
             }
             "--no-delivery-receipts" => delivery_receipts = false,
+            "--focus" => focus = true,
             "--profile-name" => {
                 profile_name = args.next().context("--profile-name needs a value")?
             }
@@ -1584,7 +1961,7 @@ fn parse_args() -> Result<Args> {
                      [--import-from OPENBUBBLES_DIR] [--import-only] \
                      [--send-as HANDLE] [--tcp PORT] \
                      [--share-profile always|first|never] \
-                     [--no-delivery-receipts] [--profile-name NAME]\n\n\
+                     [--no-delivery-receipts] [--profile-name NAME] [--focus]\n\n\
                      --profile-name labels a profile adopted from our own \
                      device in status (default \"Group G\").\n\n\
                      --no-delivery-receipts stops the helper acknowledging \
@@ -1624,6 +2001,7 @@ fn parse_args() -> Result<Args> {
         share_profile,
         delivery_receipts,
         profile_name,
+        focus,
     })
 }
 
@@ -1688,12 +2066,33 @@ async fn main() -> Result<()> {
         log::warn!("APNs connect reported: {e}");
     }
 
+    // `--focus` needs multiplex1 in the identity manager, and only if that
+    // will not trigger a re-registration this build cannot perform.
+    let (focus_on, focus_note) = if !args.focus {
+        (false, "off (start with --focus)".to_string())
+    } else {
+        match focus::registration_ok(&loaded.users) {
+            Ok(()) => (true, "on".to_string()),
+            Err(why) => {
+                log::warn!("--focus refused: {why}");
+                (false, format!("refused: {why}"))
+            }
+        }
+    };
+    // rustpush's IDSService type is not exported, so let inference name it;
+    // both arrays are constant expressions and are promoted to 'static.
+    let services = if focus_on {
+        &[&MADRID_SERVICE, &rustpush::findmy::MULTIPLEX_SERVICE] as &[_]
+    } else {
+        &[&MADRID_SERVICE] as &[_]
+    };
+
     let save_dir = StateDir::new(&args.state_dir);
     let client = IMClient::new(
         conn.clone(),
         loaded.users.clone(),
         loaded.identity,
-        &[&MADRID_SERVICE],
+        services,
         loaded.dir.join("id_cache.plist"),
         os_config.clone(),
         Box::new(move |users| {
@@ -1748,6 +2147,19 @@ async fn main() -> Result<()> {
         ),
     }
 
+    let focus = if focus_on {
+        match focus::Focus::start(conn.clone(), os_config.clone(), client.identity.clone(), &args.state_dir).await {
+            Ok(f) => Some(f),
+            Err(e) => {
+                log::warn!("Focus receiver did not start: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let focus_note = if focus_on && focus.is_none() { "failed to start; see log".to_string() } else { focus_note };
+
     let (events, _) = broadcast::channel(1024);
     let session = Arc::new(Session {
         client,
@@ -1766,6 +2178,8 @@ async fn main() -> Result<()> {
         delivery_receipts: args.delivery_receipts,
         profile_name: args.profile_name.clone(),
         profile_sent: Mutex::new(profile::Sent::default()),
+        focus,
+        focus_note,
     });
     // Worth a line of its own: if this is an email address, every message
     // will open a second thread beside the one the recipient's phone already
@@ -1850,6 +2264,16 @@ mod wire_tests {
         assert!(matches!(parse(r#"{"cmd":"mark_read","chat":{"participants":["tel:+1"]},"guid":"ABC"}"#), Command::MarkRead { guid: Some(_), .. }));
         assert!(matches!(parse(r#"{"cmd":"set_icon","chat":{"participants":["tel:+1"],"guid":"G"}}"#), Command::SetIcon { path: None, .. }));
         assert!(matches!(parse(r#"{"cmd":"send","chat":{"participants":["tel:+1"]},"attachments":[{"path":"C:\\a.pdf"}]}"#), Command::Send { .. }));
+        assert!(matches!(parse(r#"{"cmd":"send_poll","chat":{"participants":["tel:+1"]},"question":"Q","options":["a","b"]}"#), Command::SendPoll { .. }));
+        assert!(matches!(parse(r#"{"cmd":"poll_vote","chat":{"participants":["tel:+1"]},"poll_guid":"G","option_ids":[]}"#), Command::PollVote { session: None, .. }));
         assert!(matches!(parse(r#"{"cmd":"send","chat":{"participants":["tel:+1"]},"text":"hi","format":[{"start":0,"len":2,"bold":true}],"mentions":[{"start":0,"len":2,"handle":"tel:+1"}],"as_audio_message":false}"#), Command::Send { .. }));
+        assert!(matches!(parse(r#"{"cmd":"send_link","chat":{"participants":["tel:+1"]},"url":"https://x.com"}"#), Command::SendLink { fetch: true, title: None, .. }));
+        assert!(matches!(parse(r#"{"cmd":"send_link","chat":{"participants":["tel:+1"]},"url":"https://x.com","title":"T","summary":"S","image_path":"C:\\i.png","fetch":false}"#), Command::SendLink { fetch: false, image_path: Some(_), .. }));
+        assert!(matches!(parse(r#"{"cmd":"download_link_image","guid":"G","dest":"C:\\o.jpg"}"#), Command::DownloadLinkImage { .. }));
+        assert!(matches!(parse(r#"{"cmd":"focus_status","handles":["tel:+1"]}"#), Command::FocusStatus { .. }));
+        assert!(matches!(parse(r#"{"cmd":"focus_status"}"#), Command::FocusStatus { .. }));
+        assert!(matches!(parse(r#"{"cmd":"set_background","chat":{"participants":["tel:+1"],"guid":"G"}}"#), Command::SetBackground { path: None, version: None, .. }));
+        assert!(matches!(parse(r#"{"cmd":"set_background","chat":{"participants":["tel:+1"]},"path":"C:\\b.zip","version":3}"#), Command::SetBackground { path: Some(_), version: Some(3), .. }));
+        assert!(matches!(parse(r#"{"cmd":"download_background","guid":"G","dest":"C:\\b.zip"}"#), Command::DownloadBackground { .. }));
     }
 }

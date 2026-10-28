@@ -1540,6 +1540,7 @@ dependencies = [
  "log",
  "plist",
  "pretty_env_logger",
+ "reqwest",
  "rustpush",
  "serde",
  "serde_json",
