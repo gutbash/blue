@@ -15,12 +15,262 @@
 //!
 //! ## Protocol
 //!
-//! Line-delimited JSON both ways on a unix socket; one line is one object.
+//! Line-delimited JSON both ways, on a unix socket (`--socket PATH`) or on
+//! `127.0.0.1:PORT` (`--tcp PORT`, the only option on Windows). One line is
+//! one UTF-8 JSON object terminated by `\n`. Every connected client receives
+//! every event; replies go only to the client that sent the request.
 //!
-//! Requests carry an `id` echoed back on the reply:
-//!     {"id":"1","cmd":"send","chat":{...},"text":"hi"}
-//! Replies are `{"id":"1","ok":true,...}` or `{"id":"1","ok":false,"error":...}`.
-//! Unsolicited events have no `id` and carry `{"event":"..."}`.
+//! ### Envelope
+//!
+//! Request:  `{"id":"<string>","cmd":"<snake_case command>", ...fields}`
+//! `id` is optional but must be a JSON *string* to be echoed; any other type
+//! is treated as absent (`"id":null` on the reply). Unknown fields are
+//! ignored. An unparseable line still gets a reply carrying its `id`.
+//!
+//! Success:  `{"id":"1","ok":true, ...command-specific fields}`
+//! Failure:  `{"id":"1","ok":false,"error":"<message with cause chain>"}`
+//! A malformed request fails with `"error":"bad request: <serde message>"`.
+//! There is exactly one reply per request line. Requests on one connection
+//! are answered in order, one at a time; a slow upload blocks the next
+//! request on that connection (open a second connection to avoid that).
+//!
+//! ### ChatRef — the `chat` field
+//!
+//!     {"participants":["tel:+12155550100","mailto:a@b.com"],
+//!      "name":"Optional group name", "guid":"Optional chat guid",
+//!      "after_guid":"Optional newest-known message guid"}
+//!
+//! `participants`: required, full handles (`tel:+E164` or `mailto:`). Our
+//! own handle is added by rustpush if missing. More than two participants
+//! including us makes it a group. `name` -> `cv_name` (group display name).
+//! `guid` -> `sender_guid`, the conversation id iMessage threads a group by.
+//!
+//! **New vs existing group.** Omit `guid` and rustpush mints a fresh one in
+//! `MessageInst::prepare_send`; that is how a group is created — there is no
+//! separate "create group" call. The minted id comes back as `chat_guid` on
+//! the reply; store it. To post into an *existing* group, pass that value, or
+//! `inst.conversation.sender_guid` from any incoming event in that group, as
+//! `chat.guid`, together with the current participant list and name.
+//! Whether iOS merges a guid-less send into an existing thread with the same
+//! participants is device behaviour, not something this helper controls —
+//! pass the guid. [VERIFY on a device]
+//!
+//! ### Commands
+//!
+//! `status` -> `{"handles":[...],"send_as":"tel:+1…","warnings":[...],"note":"…",
+//!   "profile":{"found":bool,"display_name":"…"|null,"record_key":"…"|null,
+//!              "source":"<file it was imported from>"|null,
+//!              "share":"always|first|never"}}`
+//! `display_name` is OpenBubbles' local name field captured at import time,
+//! not a live read of the CloudKit record recipients see.
+//!
+//! **Adopting the profile from our own device.** When Name & Photo Sharing
+//! is set on the account's Mac or iPhone, that device sends `UpdateProfile`
+//! (or `ShareProfile`) to the account's other devices. When such a message
+//! arrives from one of our registered handles, the helper writes its record
+//! id + key to `share_profile.json` (atomically), loads it live, and logs
+//! `adopted shared profile from own device`. `status.profile.source` reads
+//! `"own device"` and `display_name` is `--profile-name` (default "Group G"),
+//! since the update carries no name. A profile update from anyone else is
+//! never adopted, only emitted as the usual `message` event. An update with
+//! no profile from our own device (profile deleted) drops ours.
+//!
+//! **Share Name and Photo.** With `--share-profile always|first` and a
+//! `share_profile.json` in the state dir (see `profile.rs`), `send` sets
+//! `NormalMessage.embedded_profile`, so recipients get the name and photo.
+//! `first` means once per conversation (chat guid, else participant set)
+//! per helper run. Default `never`. Tapbacks, edits and other commands never
+//! carry it.
+//!
+//! `handles` -> `{"handles":["mailto:…","tel:+1…"]}`
+//!
+//! `send` -> `{"guid":"<MESSAGE GUID, uppercase>","chat_guid":"<conversation guid>"}`
+//!
+//!     {"id":"7","cmd":"send","chat":{...},
+//!      "text":"Hello Gerry, plan attached",      // optional if attachments
+//!      "subject":"Optional subject line",
+//!      "reply_guid":"<guid>", "reply_part":"0",   // reply threading
+//!      "effect":"com.apple.MobileSMS.expressivesend.impact",
+//!      "format":[{"start":0,"len":5,"bold":true},
+//!                {"start":6,"len":5,"italic":true,"underline":true},
+//!                {"start":12,"len":4,"effect":"shake"}],
+//!      "mentions":[{"start":6,"len":5,"handle":"tel:+12155550100"}],
+//!      "attachments":[{"path":"C:\\abs\\plan.pdf"},
+//!                     {"path":"C:\\abs\\photo.heic","name":"site.heic",
+//!                      "mime":"image/heic","uti":"public.heic"}],
+//!      "as_audio_message":false}
+//!
+//! - `text`: default `""`. A send needs non-empty `text`, at least one
+//!   attachment, or both.
+//! - `format` / `mentions`: **`start` and `len` are UTF-16 code units** (as
+//!   NSString and JavaScript count), not bytes or code points. An emoji
+//!   outside the BMP is 2 units. Ranges must lie within `text`, have `len >
+//!   0`, and not split a surrogate pair. The text is split at every range edge
+//!   into `MessagePart::Text` runs; flags from overlapping ranges combine.
+//!   Format flags: `bold`, `italic`, `underline`, `strikethrough` (bools,
+//!   default false). `effect`: one of `big small shake nod explode ripple
+//!   bloom jitter` (iOS 18 animated text). rustpush's `TextFormat` is either
+//!   flags *or* one effect per run, so a span with both, or with two effects,
+//!   is rejected. Mentions become `MessagePart::Mention(handle, span text)`;
+//!   `handle` must start `tel:` or `mailto:`; mentions may not overlap each
+//!   other or any format range. `format`/`mentions` without `text` is an error.
+//! - `attachments`: absolute local paths. `name` defaults to the file name;
+//!   `mime` and `uti` each default from the extension (images incl. HEIC,
+//!   PDF, video, audio, common office types; DWG/DXF and anything unknown go
+//!   as `application/octet-stream` / `public.data`). Every path is checked
+//!   before any upload starts. Each file is encrypted and uploaded to MMCS
+//!   (`MMCSFile::prepare_put` + `MMCSFile::new`, the two halves of
+//!   `Attachment::new_mmcs`). Parts are ordered text first, then attachments
+//!   in the order given. A failed upload fails the whole send with
+//!   `ok:false`, e.g. `"uploading attachment 1 (C:\\x.jpg): MMCS upload: …"`,
+//!   and nothing is sent.
+//! - `as_audio_message`: sets rustpush's `NormalMessage.voice`, which writes
+//!   `voice-audio`/`voice-e` so iOS shows an audio-message bubble. Requires
+//!   exactly one attachment and no text; send a `.caf` (iOS voice memos are
+//!   Opus or AAC in CAF). The helper does not transcode.
+//! - `effect`: a bubble/screen effect id, passed through untouched.
+//!
+//! `set_profile` -> `{"found":true,"display_name":"Group G","record_key":"<id>",
+//!   "source":"<STATE_DIR>\\share_profile.json","share":"always|first|never"}`
+//!
+//!     {"id":"10","cmd":"set_profile","name":"Group G","first":"Group",
+//!      "last":"G","photo":"C:\\abs\\pic.jpg"}
+//!     {"id":"11","cmd":"set_profile","name":"Group G","first":"Group",
+//!      "last":"G","photo":"C:\\abs\\pic.jpg","tfa_code":"123456"}
+//!
+//! Creates our Share Name and Photo record in CloudKit (rustpush
+//! `ProfilesClient::set_record`), replacing any record the helper already
+//! holds, writes `share_profile.json`, and makes it live at once: the next
+//! `send` under `--share-profile always|first` embeds it, and `status`
+//! reports it. No restart.
+//! - `name` (required): the display name recipients see. `first`/`last`
+//!   default to `""`. `photo` optional: JPEG or PNG, center-cropped to a
+//!   square and re-encoded as a 512x512 JPEG. HEIC is rejected.
+//! - Signs in to the Apple ID with `STATE_DIR/gsa.plist` (copied from
+//!   OpenBubbles by `--import-from`). If Apple wants 2FA the reply is
+//!   `ok:false` with `error` starting **`2fa_required:`**. A code is pushed to
+//!   the account's trusted devices. Repeat the call with the same fields plus
+//!   `tfa_code`. The pending sign-in lives in memory only. After a
+//!   successful sign-in the client is reused, so later calls need no 2FA
+//!   until the helper restarts.
+//! - May take tens of seconds (GSA sign-in, MMCS/CloudKit upload). Use a
+//!   separate connection if other requests must not wait behind it.
+//!
+//! `set_icon` -> `{"guid":…,"chat_guid":…}` — set or clear a group photo.
+//!
+//!     {"id":"8","cmd":"set_icon","chat":{...,"guid":"<chat guid>"},
+//!      "path":"C:\\abs\\photo.png","group_version":0}
+//!     {"id":"9","cmd":"set_icon","chat":{...,"guid":"<chat guid>"}}
+//!
+//! With `path` the file is uploaded to MMCS and sent as `IconChange`. Without
+//! `path` an `IconChange` with no file is sent, which removes the photo.
+//! rustpush notes the image "should be 570x570 png"; the helper does not
+//! resize or convert. `group_version` defaults to 0, as on
+//! `set_participants`. [VERIFY what value iOS expects]
+//!
+//! `download_attachment` -> `{"path":"<dest>","bytes":<n>}`
+//!
+//!     {"id":"3","cmd":"download_attachment","guid":"<msg guid>","index":0,
+//!      "dest":"C:\\abs\\out.jpg"}
+//!
+//! `index` counts attachment parts within that message. Only messages
+//! received since the helper started (newest 256 with attachments) can be
+//! fetched.
+//!
+//! `react` -> `{"guid","chat_guid"}`
+//!
+//!     {"cmd":"react","chat":{...},"target_guid":"<guid>","target_text":"…",
+//!      "target_part":0,"kind":"heart|like|dislike|laugh|emphasize|question",
+//!      "emoji":"🔥","enable":true}
+//!
+//! `emoji` wins over `kind`. `enable:false` removes the tapback.
+//!
+//! `edit` -> `{"guid","chat_guid"}`:
+//! `{"cmd":"edit","chat":{...},"target_guid":"<guid>","part":0,"text":"new"}`
+//!
+//! `unsend` -> `{"guid","chat_guid"}`:
+//! `{"cmd":"unsend","chat":{...},"target_guid":"<guid>","part":0}`
+//!
+//! `typing` -> `{"guid","chat_guid"}`: `{"cmd":"typing","chat":{...},"typing":true}`
+//!
+//! `mark_read` -> `{"guid","chat_guid"}`:
+//! `{"cmd":"mark_read","chat":{...},"guid":"<newest message guid read>"}`
+//!
+//! `read_receipt` -> `{"guid","chat_guid"}`:
+//! `{"cmd":"read_receipt","chat":{...},"guid":"<message guid>"}`
+//!
+//! Both send IDS command 102 (`Message::Read`) to every participant,
+//! including our other devices. The sender sees "Read" only when the
+//! receipt's id is the guid of their message (and only if they have read
+//! receipts on for us — their device decides display). `mark_read` without
+//! `guid` sends a random id: it reaches the sender but matches no message.
+//!
+//! **Delivery receipts** are sent automatically for incoming messages from
+//! others (see `Session::acknowledge`); `--no-delivery-receipts` disables
+//! that. Nothing is emitted for them.
+//!
+//! `rename` -> `{"guid","chat_guid"}`: `{"cmd":"rename","chat":{...},"name":"New"}`
+//!
+//! `set_participants` -> `{"guid","chat_guid"}`:
+//! `{"cmd":"set_participants","chat":{...},"participants":[...],"group_version":0}`
+//!
+//! ### Events (no `id` unless stated)
+//!
+//! `{"event":"message","inst":<MessageInst>}` — everything rustpush parses
+//! off APNs, including copies of our own messages sent from other devices on
+//! the account. `inst` is rustpush's `MessageInst` serialised by serde, as is:
+//!
+//!     {"id":"<GUID>","sender":"tel:+1…"|null,
+//!      "conversation":{"participants":[...],"cv_name":…|null,
+//!                      "sender_guid":"<chat guid>"|null,"after_guid":…}|null,
+//!      "message":<Message>,"sent_timestamp":<ms since epoch>,
+//!      "target":…,"send_delivered":bool,"verification_failed":bool,
+//!      "certified_context":…}
+//!
+//! The group guid is `inst.conversation.sender_guid`; the group name is
+//! `inst.conversation.cv_name`. `message` is serde's externally tagged enum —
+//! a unit variant is a bare string, any other is a one-key object. Tell the
+//! kinds apart by that tag:
+//!
+//! | `inst.message`                                   | Meaning |
+//! | ---                                              | --- |
+//! | `{"Message":{"parts":[…],"effect":…,"reply_guid":…,"subject":…,"voice":bool,…}}` | a message |
+//! | `"Delivered"`                                    | delivery receipt (IDS command 101) |
+//! | `"Read"`                                         | read receipt (IDS command 102) |
+//! | `{"Typing":[true,null]}` / `{"Typing":[false,null]}` | typing started / stopped; 2nd item is a third-party app or null |
+//! | `{"React":{"to_uuid":…,"to_part":…,"reaction":…,"to_text":…}}` | tapback |
+//! | `{"Edit":{…}}` / `{"Unsend":{…}}`                 | edit / unsend |
+//! | `{"RenameMessage":{"new_name":…}}`               | group renamed |
+//! | `{"ChangeParticipants":{"new_participants":[…],"group_version":n}}` | members changed |
+//! | `{"IconChange":{"file":{…}|null,"group_version":n}}` | group photo set / removed |
+//! | `"MessageReadOnDevice"`, `"PeerCacheInvalidate"`, `{"Error":{…}}`, … | other rustpush variants, passed through |
+//!
+//! For `Delivered` and `Read`, `inst.id` is the IDS message uuid of the
+//! receipt, which by IDS convention is the guid of the message acknowledged,
+//! `inst.sender` is who delivered/read it, and `inst.conversation` is null.
+//! [VERIFY the id mapping against a live receipt] A typing indicator that
+//! arrives unencrypted (IDS `is_typing: 0`) carries a two-person conversation
+//! built from sender and target and is always `Typing(true)`; the encrypted
+//! form carries the real conversation and either state.
+//!
+//! Parts inside `{"Message":…}`, under `parts[i].part`:
+//! `{"Text":["run",{"Flags":{"bold":…,"italic":…,"underline":…,"strikethrough":…}}]}`,
+//! `{"Text":["run",{"Effect":"Shake"}]}`, `{"Mention":["tel:+1…","Gerry"]}`,
+//! `{"Attachment":{"a_type":{"MMCS":[…]},"part":n,"uti_type":…,"mime":…,"name":…,"iris":bool}}`,
+//! `{"Object":"breadcrumb"}`. Byte fields (MMCS keys) serialise as number
+//! arrays and cannot be sent back; use `download_attachment`.
+//!
+//! `{"event":"upload_progress","id":"<request id>"|null,"index":0,"count":2,
+//!   "bytes":1048576,"total":5242880}` — during `send` attachments and
+//! `set_icon`, roughly every 10% per file. `id` is the request it belongs to.
+//! `total` is MMCS's count and includes encryption overhead, so it can differ
+//! slightly from the file size. Advisory only: the reply is the result.
+//!
+//! `{"event":"parse_error","error":"<rustpush error>"}` — an APNs message that
+//! rustpush could not parse.
+//!
+//! `{"event":"disconnected"}` — the APNs connection closed; the helper exits
+//! about 200 ms later and must be restarted by its supervisor.
 //!
 //! Events embed rustpush's `MessageInst` verbatim under `inst`. That is a
 //! deliberate choice: the Python side already has to understand iMessage
@@ -34,7 +284,10 @@
 //! each other in a loop. The daemon is responsible for not doing that; see
 //! `SINGLETON_NOTE` below.
 
+mod compose;
 mod migrate;
+mod profile;
+mod setprofile;
 mod state;
 
 use std::collections::HashMap;
@@ -45,7 +298,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex};
 
 use rustpush::{
@@ -112,6 +368,8 @@ enum Command {
     Handles,
     Send {
         chat: ChatRef,
+        /// May be empty when `attachments` is not.
+        #[serde(default)]
         text: String,
         #[serde(default)]
         subject: Option<String>,
@@ -123,6 +381,41 @@ enum Command {
         /// e.g. "invisibleink", "slam" — an iMessage screen/bubble effect.
         #[serde(default)]
         effect: Option<String>,
+        /// Formatting ranges over `text`, in UTF-16 code units.
+        #[serde(default)]
+        format: Vec<compose::FormatRange>,
+        /// Mentions over `text`, in UTF-16 code units.
+        #[serde(default)]
+        mentions: Vec<compose::MentionRange>,
+        /// Local files, uploaded to MMCS and sent after the text.
+        #[serde(default)]
+        attachments: Vec<AttachmentSpec>,
+        /// Mark the message as a voice memo. Needs exactly one attachment
+        /// and no text.
+        #[serde(default)]
+        as_audio_message: bool,
+    },
+    /// Create or replace our Share Name and Photo record; see setprofile.rs.
+    SetProfile {
+        /// Display name recipients see.
+        name: String,
+        #[serde(default)]
+        first: String,
+        #[serde(default)]
+        last: String,
+        #[serde(default)]
+        photo: Option<String>,
+        /// Second call only, when the first answered `2fa_required:`.
+        #[serde(default)]
+        tfa_code: Option<String>,
+    },
+    /// Set (`path`) or clear (no `path`) a group's photo.
+    SetIcon {
+        chat: ChatRef,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        group_version: u64,
     },
     /// Fetch one attachment's bytes to a local file.
     ///
@@ -180,6 +473,17 @@ enum Command {
     /// Mark the thread read on every other device on the account.
     MarkRead {
         chat: ChatRef,
+        /// Guid of the newest message being marked read. Without it the
+        /// receipt carries a random id, which the sender's phone cannot match
+        /// to any message, so it never shows "Read".
+        #[serde(default)]
+        guid: Option<String>,
+    },
+    /// Send a read receipt for one message to its sender (and sync it to
+    /// our other devices). Same wire message as `mark_read` with `guid`.
+    ReadReceipt {
+        chat: ChatRef,
+        guid: String,
     },
     Rename {
         chat: ChatRef,
@@ -193,6 +497,18 @@ enum Command {
         #[serde(default)]
         group_version: u64,
     },
+}
+
+/// A local file to send. `mime` and `uti` default from the extension.
+#[derive(Deserialize)]
+struct AttachmentSpec {
+    path: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    uti: Option<String>,
 }
 
 fn yes() -> bool {
@@ -300,6 +616,21 @@ struct Session {
     warnings: Vec<String>,
     /// Optional override for the sending identity; see `my_handle`.
     send_as: Option<String>,
+    /// Our shared Name and Photo; see `profile.rs`. Behind a lock because
+    /// `set_profile` replaces it while the helper runs.
+    profile: Mutex<Option<profile::Profile>>,
+    /// Apple ID sign-in state for `set_profile`, including a pending 2FA.
+    profile_auth: Mutex<setprofile::Auth>,
+    state_dir: PathBuf,
+    os_config: Arc<dyn rustpush::OSConfig>,
+    share_mode: profile::ShareMode,
+    /// Acknowledge incoming messages; off with `--no-delivery-receipts`.
+    delivery_receipts: bool,
+    /// Display name recorded for a profile adopted from our own device,
+    /// whose update carries no name. `--profile-name`, default "Group G".
+    profile_name: String,
+    /// Conversations that already got the profile, for `--share-profile first`.
+    profile_sent: Mutex<profile::Sent>,
 }
 
 impl Session {
@@ -334,9 +665,15 @@ impl Session {
             .ok_or_else(|| anyhow!("no registered handles — registration has expired"))
     }
 
-    async fn dispatch(&self, cmd: Command) -> Result<Json> {
+    async fn dispatch(&self, id: Option<String>, cmd: Command) -> Result<Json> {
         match cmd {
-            Command::Status => Ok(json!({
+            Command::Status => {
+                // Snapshot first: holding the lock inside `json!` while
+                // locking it again would deadlock.
+                let prof = self.profile.lock().await.as_ref().map(|p| {
+                    (p.display_name.clone(), p.message.cloud_kit_record_key.clone(), p.source.clone())
+                });
+                Ok(json!({
                 "handles": self.handles,
                 // Which identity messages actually go out as. Surfaced
                 // because sending from the wrong one silently splits the
@@ -345,7 +682,15 @@ impl Session {
                 "send_as": self.my_handle().unwrap_or("<none>"),
                 "warnings": self.warnings,
                 "note": SINGLETON_NOTE,
-            })),
+                "profile": {
+                    "found": prof.as_ref().is_some(),
+                    "display_name": prof.as_ref().and_then(|p| p.0.clone()),
+                    "record_key": prof.as_ref().map(|p| p.1.clone()),
+                    "source": prof.as_ref().and_then(|p| p.2.clone()),
+                    "share": self.share_mode.as_str(),
+                },
+            }))
+            }
             Command::Handles => Ok(json!({ "handles": self.handles })),
 
             Command::Send {
@@ -355,9 +700,53 @@ impl Session {
                 reply_guid,
                 reply_part,
                 effect,
+                format,
+                mentions,
+                attachments,
+                as_audio_message,
             } => {
-                let mut normal = NormalMessage::new(text, MessageType::IMessage);
+                if text.is_empty() && attachments.is_empty() {
+                    bail!("send needs `text`, `attachments`, or both");
+                }
+                if text.is_empty() && !(format.is_empty() && mentions.is_empty()) {
+                    bail!("`format` and `mentions` need `text`");
+                }
+                if as_audio_message && (attachments.len() != 1 || !text.is_empty()) {
+                    bail!("`as_audio_message` needs exactly one attachment and no text");
+                }
+                // Validate every file before uploading any, so a bad path
+                // late in the list doesn't cost the uploads ahead of it.
+                for (i, a) in attachments.iter().enumerate() {
+                    let meta = std::fs::metadata(&a.path)
+                        .with_context(|| format!("attachment {i}: {}", a.path))?;
+                    if !meta.is_file() {
+                        bail!("attachment {i}: {} is not a file", a.path);
+                    }
+                }
+                // Text first, then attachments, which is the order iOS lays
+                // a mixed message out in.
+                let mut parts = if text.is_empty() {
+                    Vec::new()
+                } else {
+                    compose::text_parts(&text, &format, &mentions)?
+                };
+                let count = attachments.len();
+                for (i, a) in attachments.iter().enumerate() {
+                    let att = self
+                        .upload_attachment(id.as_deref(), i, count, a)
+                        .await
+                        .with_context(|| format!("uploading attachment {i} ({})", a.path))?;
+                    parts.push(IndexedMessagePart {
+                        part: MessagePart::Attachment(att),
+                        idx: None,
+                        ext: None,
+                    });
+                }
+                let mut normal = NormalMessage::new(String::new(), MessageType::IMessage);
+                normal.parts = MessageParts(parts);
+                normal.voice = as_audio_message;
                 normal.subject = subject;
+                normal.embedded_profile = self.profile_for(&chat).await;
                 // rustpush builds the reply field as `r:<part>:<guid>` and
                 // unwraps `reply_part` unconditionally whenever `reply_guid`
                 // is set (messages.rs:2261). Passing a guid without a part
@@ -460,7 +849,75 @@ impl Session {
                 self.send(chat, Message::Typing(typing, None)).await
             }
 
-            Command::MarkRead { chat } => self.send(chat, Message::Read).await,
+            Command::MarkRead { chat, guid } => self.send_read(chat, guid).await,
+            Command::ReadReceipt { chat, guid } => self.send_read(chat, Some(guid)).await,
+
+            Command::SetProfile {
+                name,
+                first,
+                last,
+                photo,
+                tfa_code,
+            } => {
+                if name.trim().is_empty() {
+                    bail!("set_profile needs a non-empty `name`");
+                }
+                // Prepared before signing in, so a bad photo costs nothing.
+                let photo = photo.as_deref().map(setprofile::prepare_photo).transpose()?;
+                let current = self.profile.lock().await.as_ref().map(|p| p.message.clone());
+                let mut auth = self.profile_auth.lock().await;
+                let outcome = setprofile::set_profile(
+                    &self.os_config,
+                    &self.conn,
+                    &self.state_dir,
+                    &mut auth,
+                    current,
+                    rustpush::name_photo_sharing::IMessageNameRecord { name, first, last },
+                    photo,
+                    tfa_code.as_deref(),
+                )
+                .await?;
+                match outcome {
+                    setprofile::Outcome::Needs2fa(why) => bail!(
+                        "2fa_required: {why}; call set_profile again with the same \
+                         fields plus \"tfa_code\""
+                    ),
+                    setprofile::Outcome::Done(p) => {
+                        let reply = json!({
+                            "found": true,
+                            "display_name": p.display_name,
+                            "record_key": p.message.cloud_kit_record_key,
+                            "source": p.source,
+                            "share": self.share_mode.as_str(),
+                        });
+                        // Live: the next send carries the new record.
+                        *self.profile.lock().await = Some(p);
+                        Ok(reply)
+                    }
+                }
+            }
+
+            Command::SetIcon {
+                chat,
+                path,
+                group_version,
+            } => {
+                // No path means "remove the photo": rustpush sends the
+                // IconChange with no file and `meta: "ngp"`.
+                let file = match path {
+                    None => None,
+                    Some(p) => Some(
+                        self.upload_mmcs(id.as_deref(), 0, 1, &p)
+                            .await
+                            .with_context(|| format!("uploading group photo {p}"))?,
+                    ),
+                };
+                self.send(
+                    chat,
+                    Message::IconChange(rustpush::IconChangeMessage { file, group_version }),
+                )
+                .await
+            }
 
             Command::Rename { chat, name } => {
                 self.send(chat, Message::RenameMessage(RenameMessage { new_name: name }))
@@ -538,7 +995,258 @@ impl Session {
             .send(&mut inst)
             .await
             .context("sending to Apple")?;
-        Ok(json!({ "guid": guid }))
+        // rustpush mints the conversation guid in `prepare_send` when the
+        // caller gave none (which is how a new group comes into being), so
+        // it is read back here for the caller to keep.
+        let chat_guid = inst
+            .conversation
+            .as_ref()
+            .and_then(|c| c.sender_guid.clone());
+        Ok(json!({ "guid": guid, "chat_guid": chat_guid }))
+    }
+
+    /// Adopt the Share Name and Photo profile our own other device (the
+    /// account's Mac or iPhone) announces.
+    ///
+    /// When Name & Photo Sharing is set up on an Apple device, it sends
+    /// `UpdateProfile` (rustpush logs it as "Updated their profile") to the
+    /// account's other devices, carrying the CloudKit record id and the
+    /// decryption key — exactly what outgoing messages embed. `ShareProfile`
+    /// carries the same pair. Only messages whose sender is one of OUR
+    /// registered handles are adopted: anyone else's is that contact's
+    /// profile and is only published as an event.
+    ///
+    /// The update has no display name. Reading it from the record needs
+    /// `ProfilesClient::get_record`, which needs a signed-in CloudKit client,
+    /// and sign-in is what Apple refused (-80045). So the name recorded is
+    /// `--profile-name`. It only labels `status`; recipients see the name in
+    /// the record.
+    async fn maybe_adopt_profile(&self, inst: &MessageInst) {
+        let from_me = inst.sender.as_ref().is_some_and(|s| self.handles.contains(s));
+        if !from_me {
+            return;
+        }
+        let announced = match &inst.message {
+            Message::UpdateProfile(u) => u.profile.clone(),
+            Message::ShareProfile(m) => Some(m.clone()),
+            _ => return,
+        };
+        let Some(message) = announced else {
+            // Our own device deleted the profile: stop sharing it.
+            if self.profile.lock().await.take().is_some() {
+                match profile::remove(&self.state_dir) {
+                    Ok(()) => log::info!("own device deleted the shared profile; dropped it"),
+                    Err(e) => log::warn!("could not remove {}: {e}", profile::FILE),
+                }
+            }
+            return;
+        };
+        let mut current = self.profile.lock().await;
+        let same = current.as_ref().is_some_and(|p| {
+            p.message.cloud_kit_record_key == message.cloud_kit_record_key
+                && p.message.cloud_kit_decryption_record_key == message.cloud_kit_decryption_record_key
+        });
+        if same {
+            // Apple devices send the update several times; once is enough.
+            return;
+        }
+        let source = "own device";
+        if let Err(e) = profile::save(&self.state_dir, &message, Some(&self.profile_name), source) {
+            log::error!("adopting shared profile from own device: {e:#}");
+            return;
+        }
+        log::info!(
+            "adopted shared profile from own device ({}, record {})",
+            inst.sender.as_deref().unwrap_or("?"),
+            message.cloud_kit_record_key
+        );
+        *current = Some(profile::Profile {
+            message,
+            display_name: Some(self.profile_name.clone()),
+            source: Some(source.to_string()),
+        });
+    }
+
+    /// A `Read` receipt. iMessage matches a read receipt to a message by the
+    /// receipt's own id, so it must be the guid of the message read.
+    async fn send_read(&self, chat: ChatRef, guid: Option<String>) -> Result<Json> {
+        let _guard = self.send_lock.lock().await;
+        let conversation: ConversationData = chat.into();
+        let mut inst = MessageInst::new(conversation, self.my_handle()?, Message::Read);
+        if let Some(g) = guid {
+            inst.id = g.to_uppercase();
+        }
+        let id = inst.id.clone();
+        self.client.send(&mut inst).await.context("sending read receipt")?;
+        let chat_guid = inst.conversation.as_ref().and_then(|c| c.sender_guid.clone());
+        Ok(json!({ "guid": id, "chat_guid": chat_guid }))
+    }
+
+    /// Acknowledge an incoming message the way a device does, so the sender
+    /// sees "Delivered".
+    ///
+    /// rustpush only certifies delivery for messages it could not parse
+    /// (aps_client.rs `process_msg`); a parsed one is left unacknowledged,
+    /// which is why nothing showed "Delivered". Two mechanisms, as the
+    /// sender's payload dictates:
+    /// - Certified delivery (current iOS): the payload carries a
+    ///   `certified_context`. Answer with `certify_delivery`; `notify` asks
+    ///   Apple to generate the "Delivered" receipt (`gd`) and is set only
+    ///   when the sender requested one. Every certified message is acked.
+    /// - Legacy: the payload sets `send_delivered` with no certified context.
+    ///   Answer with a `Message::Delivered` carrying the message's guid,
+    ///   addressed to the sender's device token only.
+    ///
+    /// Senders request delivered receipts for 1:1 messages and for tapbacks
+    /// in groups (rustpush `should_send_delivered`, mirroring iOS), so group
+    /// messages are acked but iOS shows no "Delivered" for them, as on a
+    /// real phone.
+    async fn acknowledge(&self, inst: MessageInst) {
+        let from_me = inst.sender.as_ref().map_or(true, |s| self.handles.contains(s));
+        if from_me {
+            return;
+        }
+        let is_user_message = matches!(
+            inst.message,
+            Message::Message(_) | Message::React(_) | Message::Edit(_) | Message::Unsend(_)
+                | Message::RenameMessage(_) | Message::ChangeParticipants(_)
+                | Message::IconChange(_)
+        );
+        if !is_user_message {
+            return;
+        }
+        if let Some(ctx) = &inst.certified_context {
+            if let Err(e) = self
+                .client
+                .identity
+                .certify_delivery("com.apple.madrid", ctx, inst.send_delivered)
+                .await
+            {
+                log::warn!("certifying delivery of {}: {e}", inst.id);
+            } else {
+                log::debug!("certified delivery of {} (notify {})", inst.id, inst.send_delivered);
+            }
+            return;
+        }
+        if !inst.send_delivered {
+            return;
+        }
+        let Some(sender) = inst.sender.clone() else { return };
+        // Send as whichever of our handles the message was addressed to.
+        let me = inst
+            .conversation
+            .as_ref()
+            .and_then(|c| c.participants.iter().find(|p| self.handles.contains(*p)).cloned())
+            .or_else(|| self.my_handle().ok().map(str::to_string));
+        let Some(me) = me else { return };
+        let mut receipt = MessageInst {
+            id: inst.id.clone(),
+            sender: Some(me),
+            conversation: Some(ConversationData {
+                participants: vec![sender],
+                cv_name: None,
+                sender_guid: inst.conversation.as_ref().and_then(|c| c.sender_guid.clone()),
+                after_guid: None,
+            }),
+            message: Message::Delivered,
+            sent_timestamp: 0,
+            // The sender's own push token, so only the sending device gets it.
+            target: inst.target.clone(),
+            send_delivered: false,
+            verification_failed: false,
+            certified_context: None,
+        };
+        let _guard = self.send_lock.lock().await;
+        if let Err(e) = self.client.send(&mut receipt).await {
+            log::warn!("sending delivered receipt for {}: {e}", inst.id);
+        }
+    }
+
+    /// The `embedded_profile` for a message to `chat` under `--share-profile`.
+    async fn profile_for(&self, chat: &ChatRef) -> Option<rustpush::ShareProfileMessage> {
+        let guard = self.profile.lock().await;
+        let p = guard.as_ref()?;
+        match self.share_mode {
+            profile::ShareMode::Never => None,
+            profile::ShareMode::Always => Some(p.message.clone()),
+            profile::ShareMode::First => self
+                .profile_sent
+                .lock()
+                .await
+                .first_time(chat.guid.as_deref(), &chat.participants)
+                .then(|| p.message.clone()),
+        }
+    }
+
+    /// Encrypt and upload one file to MMCS, emitting `upload_progress` events
+    /// tagged with the request id.
+    async fn upload_mmcs(
+        &self,
+        id: Option<&str>,
+        index: usize,
+        count: usize,
+        path: &str,
+    ) -> Result<rustpush::MMCSFile> {
+        // Two passes over the file: `prepare_put` hashes and chunks it, then
+        // the upload reads it again. Re-opened rather than seeked so neither
+        // pass depends on the other's read position.
+        let first = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+        let prepared = rustpush::MMCSFile::prepare_put(first)
+            .await
+            .map_err(|e| anyhow!("preparing upload: {e}"))?;
+        let reader = std::fs::File::open(path).with_context(|| format!("opening {path}"))?;
+        let events = self.events.clone();
+        let id = id.map(str::to_string);
+        let mut last_decile: i64 = -1;
+        rustpush::MMCSFile::new(&self.conn, &prepared, reader, move |done, total| {
+            let pct = if total == 0 { 100 } else { (done * 100 / total) as i64 };
+            // Every 10%, not every chunk: a large video would otherwise flood
+            // every connected client.
+            if pct / 10 != last_decile {
+                last_decile = pct / 10;
+                let _ = events.send(
+                    json!({
+                        "event": "upload_progress",
+                        "id": id,
+                        "index": index,
+                        "count": count,
+                        "bytes": done,
+                        "total": total,
+                    })
+                    .to_string(),
+                );
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("MMCS upload: {e}"))
+    }
+
+    async fn upload_attachment(
+        &self,
+        id: Option<&str>,
+        index: usize,
+        count: usize,
+        spec: &AttachmentSpec,
+    ) -> Result<rustpush::Attachment> {
+        let path = std::path::Path::new(&spec.path);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let (mime, uti) = compose::mime_uti(ext);
+        let name = spec
+            .name
+            .clone()
+            .or_else(|| path.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .unwrap_or_else(|| "file".to_string());
+        let mmcs = self.upload_mmcs(id, index, count, &spec.path).await?;
+        // The same record `Attachment::new_mmcs` builds after its upload;
+        // built here so the upload can share `upload_mmcs`'s progress events.
+        Ok(rustpush::Attachment {
+            a_type: rustpush::AttachmentType::MMCS(vec![mmcs]),
+            part: index as u64,
+            uti_type: spec.uti.clone().unwrap_or_else(|| uti.to_string()),
+            mime: spec.mime.clone().unwrap_or_else(|| mime.to_string()),
+            name,
+            iris: false,
+        })
     }
 }
 
@@ -590,7 +1298,19 @@ async fn pump(session: Arc<Session>, conn: rustpush::APSConnection) {
             }
         };
         match session.client.handle(aps).await {
-            Ok(Some(inst)) => publish(&session, inst),
+            Ok(Some(inst)) => {
+                if session.delivery_receipts {
+                    // Off the pump: the receipt is a network round trip and
+                    // must not hold up the next inbound message.
+                    let s = session.clone();
+                    let copy = inst.clone();
+                    tokio::spawn(async move { s.acknowledge(copy).await });
+                }
+                // Before publishing, so a status query prompted by the
+                // event already sees the adopted profile.
+                session.maybe_adopt_profile(&inst).await;
+                publish(&session, inst)
+            }
             Ok(None) => {}
             Err(e) => {
                 log::warn!("could not parse an inbound message: {e}");
@@ -627,27 +1347,63 @@ fn publish(session: &Session, inst: MessageInst) {
 // socket
 // ---------------------------------------------------------------------------
 
-async fn serve(session: Arc<Session>, listener: UnixListener) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let session = session.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(session, stream).await {
-                        log::debug!("client disconnected: {e}");
+/// Where the helper listens. Unix socket on Linux (unchanged); a loopback TCP
+/// port with `--tcp`, which is the only option on Windows.
+enum Listener {
+    #[cfg(unix)]
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+async fn serve(session: Arc<Session>, listener: Listener) {
+    match listener {
+        #[cfg(unix)]
+        Listener::Unix(l) => loop {
+            match l.accept().await {
+                Ok((stream, _)) => spawn_client(session.clone(), stream),
+                Err(e) => {
+                    log::error!("accept failed: {e}");
+                    return;
+                }
+            }
+        },
+        Listener::Tcp(l) => loop {
+            match l.accept().await {
+                Ok((stream, peer)) => {
+                    // Bound to loopback, but any local process can still
+                    // connect; there is no peer-credential check on TCP.
+                    if !peer.ip().is_loopback() {
+                        log::warn!("refusing non-loopback peer {peer}");
+                        continue;
                     }
-                });
+                    let _ = stream.set_nodelay(true);
+                    spawn_client(session.clone(), stream)
+                }
+                Err(e) => {
+                    log::error!("accept failed: {e}");
+                    return;
+                }
             }
-            Err(e) => {
-                log::error!("accept failed: {e}");
-                return;
-            }
-        }
+        },
     }
 }
 
-async fn handle_client(session: Arc<Session>, stream: UnixStream) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+fn spawn_client<S>(session: Arc<Session>, stream: S)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = handle_client(session, stream).await {
+            log::debug!("client disconnected: {e}");
+        }
+    });
+}
+
+async fn handle_client<S>(session: Arc<Session>, stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
 
     // Push events to this client for as long as it stays connected.
@@ -691,7 +1447,7 @@ async fn handle_client(session: Arc<Session>, stream: UnixStream) -> Result<()> 
             .and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string)));
 
         let reply = match serde_json::from_str::<Command>(&line) {
-            Ok(cmd) => match session.dispatch(cmd).await {
+            Ok(cmd) => match session.dispatch(id.clone(), cmd).await {
                 Ok(data) => Reply { id, ok: true, error: None, data },
                 Err(e) => Reply {
                     id,
@@ -739,6 +1495,13 @@ struct Args {
     /// Send as this handle rather than the default. Full form, e.g.
     /// `tel:+12155550100` or `mailto:you@icloud.com`.
     send_as: Option<String>,
+    /// Listen on 127.0.0.1:PORT instead of a unix socket. Required on
+    /// Windows; optional elsewhere.
+    tcp_port: Option<u16>,
+    /// When to attach our shared Name and Photo: always | first | never.
+    share_profile: profile::ShareMode,
+    delivery_receipts: bool,
+    profile_name: String,
 }
 
 fn parse_args() -> Result<Args> {
@@ -747,6 +1510,10 @@ fn parse_args() -> Result<Args> {
     let mut import_from = None;
     let mut import_only = false;
     let mut send_as = None;
+    let mut tcp_port: Option<u16> = None;
+    let mut share_profile = profile::ShareMode::Never;
+    let mut delivery_receipts = true;
+    let mut profile_name = "Group G".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -755,11 +1522,37 @@ fn parse_args() -> Result<Args> {
             "--import-from" => import_from = args.next().map(PathBuf::from),
             "--import-only" => import_only = true,
             "--send-as" => send_as = args.next(),
+            "--tcp" => {
+                tcp_port = Some(
+                    args.next()
+                        .context("--tcp needs a port")?
+                        .parse()
+                        .context("--tcp port must be 1-65535")?,
+                )
+            }
+            "--no-delivery-receipts" => delivery_receipts = false,
+            "--profile-name" => {
+                profile_name = args.next().context("--profile-name needs a value")?
+            }
+            "--share-profile" => {
+                share_profile =
+                    profile::ShareMode::parse(&args.next().context("--share-profile needs a value")?)?
+            }
             "--help" | "-h" => {
                 println!(
                     "ib-imessage --state-dir DIR --socket PATH \
                      [--import-from OPENBUBBLES_DIR] [--import-only] \
-                     [--send-as HANDLE]\n\n\
+                     [--send-as HANDLE] [--tcp PORT] \
+                     [--share-profile always|first|never] \
+                     [--no-delivery-receipts] [--profile-name NAME]\n\n\
+                     --profile-name labels a profile adopted from our own \
+                     device in status (default \"Group G\").\n\n\
+                     --no-delivery-receipts stops the helper acknowledging \
+                     incoming messages, so senders never see Delivered.\n\n\
+                     --share-profile attaches the Name and Photo in \
+                     STATE_DIR/share_profile.json to outgoing messages: on \
+                     every one, on the first per conversation since start, \
+                     or never (default).\n\n\
                      --send-as picks the identity messages are sent from, \
                      e.g. tel:+12155550100. Defaults to the registered phone \
                      number, because sending from an email address starts a \
@@ -779,14 +1572,18 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         state_dir: state_dir.context("--state-dir is required")?,
         // Only the serving path needs somewhere to listen.
-        socket: match (socket, import_only) {
+        socket: match (socket, import_only || tcp_port.is_some()) {
             (Some(s), _) => Some(s),
             (None, true) => None,
-            (None, false) => bail!("--socket is required"),
+            (None, false) => bail!("--socket or --tcp is required"),
         },
         import_from,
         import_only,
         send_as,
+        tcp_port,
+        share_profile,
+        delivery_receipts,
+        profile_name,
     })
 }
 
@@ -800,6 +1597,8 @@ async fn main() -> Result<()> {
         dir.import_from(src)
             .with_context(|| format!("importing registration from {}", src.display()))?;
         log::info!("imported registration from {}", src.display());
+        log::info!("{}", profile::import(src, &args.state_dir));
+        log::info!("{}", profile::import_anisette(src, &args.state_dir));
     }
     if args.import_only {
         // Load once before declaring success: a copied-but-unloadable
@@ -885,6 +1684,30 @@ async fn main() -> Result<()> {
     }
     log::info!("registered handles: {}", handles.join(", "));
 
+    // A bad profile file is a warning, not a startup failure: sending without
+    // the profile is what happened before it existed.
+    let shared_profile = match profile::load(&args.state_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("shared profile not loaded: {e:#}");
+            None
+        }
+    };
+    match (&shared_profile, args.share_profile) {
+        (Some(p), m) => log::info!(
+            "shared profile {} ({}); --share-profile {}",
+            p.message.cloud_kit_record_key,
+            p.display_name.as_deref().unwrap_or("no display name"),
+            m.as_str()
+        ),
+        (None, profile::ShareMode::Never) => {}
+        (None, m) => log::warn!(
+            "--share-profile {} but no {} in the state dir; sending without it",
+            m.as_str(),
+            profile::FILE
+        ),
+    }
+
     let (events, _) = broadcast::channel(1024);
     let session = Arc::new(Session {
         client,
@@ -895,6 +1718,14 @@ async fn main() -> Result<()> {
         send_lock: Mutex::new(()),
         warnings,
         send_as: args.send_as.clone(),
+        profile: Mutex::new(shared_profile),
+        profile_auth: Mutex::new(setprofile::Auth::default()),
+        state_dir: args.state_dir.clone(),
+        os_config: os_config.clone(),
+        share_mode: args.share_profile,
+        delivery_receipts: args.delivery_receipts,
+        profile_name: args.profile_name.clone(),
+        profile_sent: Mutex::new(profile::Sent::default()),
     });
     // Worth a line of its own: if this is an email address, every message
     // will open a second thread beside the one the recipient's phone already
@@ -904,19 +1735,35 @@ async fn main() -> Result<()> {
         Err(e) => log::warn!("no sending identity: {e}"),
     }
 
-    // A leftover socket from a crash would otherwise make bind fail forever.
-    // Unwrapped here rather than earlier: --import-only returns above and
-    // legitimately has no socket.
-    let socket_path = args
-        .socket
-        .as_ref()
-        .expect("socket is required unless --import-only");
+    let listener = match args.tcp_port {
+        Some(port) => {
+            // Loopback only. The socket sends as the user's Apple ID; it must
+            // never be reachable from the network.
+            let l = TcpListener::bind(("127.0.0.1", port))
+                .await
+                .with_context(|| format!("binding 127.0.0.1:{port}"))?;
+            log::info!("listening on 127.0.0.1:{port}");
+            Listener::Tcp(l)
+        }
+        None => bind_unix(args.socket.as_ref().expect("checked in parse_args"))?,
+    };
+
+    tokio::spawn(pump(session.clone(), conn));
+    serve(session, listener).await;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn bind_unix(_path: &std::path::Path) -> Result<Listener> {
+    bail!("unix sockets are not supported on this platform; use --tcp PORT")
+}
+
+#[cfg(unix)]
+fn bind_unix(socket_path: &std::path::Path) -> Result<Listener> {
     // A unix socket's inode outlives the process that bound it, so a crash or
     // a SIGKILL leaves a file that makes bind() fail with EADDRINUSE forever.
     // Unlink unconditionally rather than testing exists() first: the check is
-    // racy, and a removal failure must be reported, not swallowed — silently
-    // ignoring it turns a read-only or wrong-owner runtime directory into a
-    // baffling "address already in use".
+    // racy, and a removal failure must be reported, not swallowed.
     match std::fs::remove_file(socket_path) {
         Ok(()) => log::debug!("removed stale socket {}", socket_path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -939,12 +1786,30 @@ async fn main() -> Result<()> {
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
     }
     log::info!("listening on {}", socket_path.display());
-
-    tokio::spawn(pump(session.clone(), conn));
-    serve(session, listener).await;
-    Ok(())
+    Ok(Listener::Unix(listener))
 }
 
 // Silence an unused-import warning when the map type is only used indirectly.
 #[allow(dead_code)]
 type _Ages = HashMap<String, u64>;
+
+#[cfg(test)]
+mod wire_tests {
+    use super::Command;
+
+    fn parse(s: &str) -> Command {
+        serde_json::from_str(s).unwrap_or_else(|e| panic!("{s}: {e}"))
+    }
+
+    #[test]
+    fn new_commands_parse() {
+        assert!(matches!(parse(r#"{"cmd":"set_profile","name":"Group G","first":"Group","last":"G","photo":"C:\\x.jpg"}"#), Command::SetProfile { .. }));
+        assert!(matches!(parse(r#"{"cmd":"set_profile","name":"Group G","tfa_code":"123456"}"#), Command::SetProfile { tfa_code: Some(_), .. }));
+        assert!(matches!(parse(r#"{"cmd":"read_receipt","chat":{"participants":["tel:+1"]},"guid":"ABC"}"#), Command::ReadReceipt { .. }));
+        assert!(matches!(parse(r#"{"cmd":"mark_read","chat":{"participants":["tel:+1"]}}"#), Command::MarkRead { guid: None, .. }));
+        assert!(matches!(parse(r#"{"cmd":"mark_read","chat":{"participants":["tel:+1"]},"guid":"ABC"}"#), Command::MarkRead { guid: Some(_), .. }));
+        assert!(matches!(parse(r#"{"cmd":"set_icon","chat":{"participants":["tel:+1"],"guid":"G"}}"#), Command::SetIcon { path: None, .. }));
+        assert!(matches!(parse(r#"{"cmd":"send","chat":{"participants":["tel:+1"]},"attachments":[{"path":"C:\\a.pdf"}]}"#), Command::Send { .. }));
+        assert!(matches!(parse(r#"{"cmd":"send","chat":{"participants":["tel:+1"]},"text":"hi","format":[{"start":0,"len":2,"bold":true}],"mentions":[{"start":0,"len":2,"handle":"tel:+1"}],"as_audio_message":false}"#), Command::Send { .. }));
+    }
+}

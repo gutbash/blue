@@ -49,3 +49,6 @@ rust/*/target/
 # off any published fork rather than being sanitized into uselessness.
 AGENTS.md
 CLAUDE.md
+
+# extra cargo build dirs used while the service runs from target-next
+rust/ib-imessage/target-next*/
