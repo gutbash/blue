@@ -24,6 +24,8 @@ base64 = "0.21"
 log = "0.4"
 pretty_env_logger = "0.5"
 anyhow = "1"
+# Rebuild transcript-background zips; same version and features as rustpush.
+zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 # OpenGraph fetch for send_link. Same major as rustpush, so features unify.
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 # Square-crop and re-encode the set_profile photo. JPEG/PNG only, to keep the

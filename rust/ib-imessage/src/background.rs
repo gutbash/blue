@@ -118,21 +118,9 @@ pub fn validate_payload(path: &str) -> Result<String> {
              with download_background."
         );
     }
-    let parsed = SimplifiedTranscriptPoster::parse_payload(&bytes)
-        .map_err(|e| anyhow::anyhow!("{path} is not a transcript-background payload: {e}"))?;
-    Ok(poster_kind(&parsed))
-}
-
-fn poster_kind(p: &SimplifiedTranscriptPoster) -> String {
-    use rustpush::posterkit::PosterType::*;
-    match &p.poster.r#type {
-        Photo { .. } => "photo",
-        Monogram { .. } => "monogram",
-        Memoji { .. } => "memoji",
-        TranscriptDynamic { .. } => "dynamic",
-        TranscriptGradient { .. } => "gradient",
-    }
-    .to_string()
+    let (kind, _) = crate::bgbuild::inspect(&bytes)
+        .map_err(|e| anyhow::anyhow!("{path} is not a transcript-background payload: {e:#}"))?;
+    Ok(kind)
 }
 
 pub fn build(file: Option<MMCSFile>, version: u64, chat_id: Option<String>) -> SetTranscriptBackgroundMessage {
@@ -142,9 +130,11 @@ pub fn build(file: Option<MMCSFile>, version: u64, chat_id: Option<String>) -> S
 /// Write the downloaded payload's watch preview image next to it, if any.
 /// Returns (preview path, poster kind).
 pub fn extract_preview(payload: &[u8], dest: &std::path::Path) -> (Option<String>, Option<String>) {
-    let Ok(p) = SimplifiedTranscriptPoster::parse_payload(payload) else { return (None, None) };
-    let kind = Some(poster_kind(&p));
-    let data = &p.watch.background_image_data;
+    // Read directly: rustpush's parser rejects iOS 26 photo posters
+    // ("missing field `assetUUID`").
+    let Ok((kind, data)) = crate::bgbuild::inspect(payload) else { return (None, None) };
+    let kind = Some(kind);
+    let data = &data;
     let ext = match image::guess_format(data) {
         Ok(image::ImageFormat::Png) => "png",
         Ok(image::ImageFormat::Jpeg) => "jpg",

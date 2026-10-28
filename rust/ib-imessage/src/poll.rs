@@ -52,20 +52,70 @@ static SESSIONS: LazyLock<Mutex<HashMap<String, String>>> =
 static PAYLOADS: LazyLock<Mutex<HashMap<String, Json>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Update message guid -> original poll guid, both uppercase. After an
+/// option is added, iOS points later votes at the newest update message
+/// (seen live 2026-10-28: poll 685B5F39, update D79A3D71, Thursday vote on
+/// D79A3D71), so every lookup goes through `canonical`.
+static ALIASES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Original poll guid (uppercase) -> newest message guid of that poll (the
+/// creation or the latest update), which is what iOS votes on.
+static LATEST: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The original poll guid for a poll guid or any of its update guids,
+/// uppercase. An unknown guid comes back as is, uppercased.
+pub fn canonical(guid: &str) -> String {
+    let mut g = guid.to_uppercase();
+    let Ok(m) = ALIASES.lock() else { return g };
+    for _ in 0..32 {
+        match m.get(&g) {
+            Some(next) if *next != g => g = next.clone(),
+            _ => break,
+        }
+    }
+    g
+}
+
+/// Record that `update` (a type-2 update message) belongs to the poll that
+/// `target` names (the poll or an earlier update), and is now its newest.
+pub fn add_alias(update: &str, target: &str) {
+    let root = canonical(target);
+    let update = update.to_uppercase();
+    if update.is_empty() || update == root {
+        return;
+    }
+    if let Ok(mut m) = ALIASES.lock() {
+        m.insert(update.clone(), root.clone());
+    }
+    if let Ok(mut m) = LATEST.lock() {
+        m.insert(root, update);
+    }
+}
+
+/// The guid a vote on this poll targets: the poll's newest message, as iOS
+/// does after an update; the poll itself when no update is known.
+pub fn latest_of(guid: &str) -> String {
+    let root = canonical(guid);
+    LATEST.lock().ok().and_then(|m| m.get(&root).cloned()).unwrap_or(root)
+}
+
 pub fn payload_of(poll_guid: &str) -> Option<Json> {
-    PAYLOADS.lock().ok()?.get(&poll_guid.to_uppercase()).cloned()
+    PAYLOADS.lock().ok()?.get(&canonical(poll_guid)).cloned()
 }
 
 pub fn session_of(poll_guid: &str) -> Option<String> {
-    SESSIONS.lock().ok()?.get(&poll_guid.to_uppercase()).cloned()
+    SESSIONS.lock().ok()?.get(&canonical(poll_guid)).cloned()
 }
 
 fn remember(poll_guid: &str, session: Option<&str>, options: Option<Vec<(String, String)>>) {
+    let key = canonical(poll_guid);
     if let (Some(s), Ok(mut m)) = (session, SESSIONS.lock()) {
-        m.entry(poll_guid.to_uppercase()).or_insert_with(|| s.to_string());
+        m.entry(key.clone()).or_insert_with(|| s.to_string());
     }
     if let (Some(o), Ok(mut m)) = (options, OPTIONS.lock()) {
-        m.insert(poll_guid.to_string(), o);
+        m.insert(key, o);
     }
 }
 
@@ -176,6 +226,13 @@ pub fn events_for(inst: &MessageInst) -> Vec<Json> {
         log::warn!("poll {}: could not decode balloon URL", inst.id);
         return vec![];
     };
+    // A type-2 update carrying the option list becomes an alias of its poll
+    // (or of the poll an earlier update belongs to).
+    if let (Some(target), Message::React(_)) = (assoc_guid, &inst.message) {
+        if payload["item"]["orderedPollOptions"].is_array() {
+            add_alias(&inst.id, target);
+        }
+    }
     remember(assoc_guid.unwrap_or(&inst.id), balloon.session.as_deref(), None);
     from_payload(
         &payload,
@@ -187,6 +244,9 @@ pub fn events_for(inst: &MessageInst) -> Vec<Json> {
 
 /// Pure part of `events_for`, testable without a `MessageInst`.
 pub fn from_payload(payload: &Json, poll_guid: &str, sender: Option<&str>, chat: Json) -> Vec<Json> {
+    // Votes and updates may name an update message; report the poll itself.
+    let poll_guid = canonical(poll_guid);
+    let poll_guid = poll_guid.as_str();
     let item = &payload["item"];
     if let Some(opts) = item["orderedPollOptions"].as_array() {
         let pairs: Vec<(String, String)> = opts
@@ -200,6 +260,9 @@ pub fn from_payload(payload: &Json, poll_guid: &str, sender: Option<&str>, chat:
             .collect();
         if let Ok(mut m) = OPTIONS.lock() {
             m.insert(poll_guid.to_string(), pairs.clone());
+        }
+        if let Ok(mut m) = LATEST.lock() {
+            m.entry(poll_guid.to_string()).or_insert_with(|| poll_guid.to_string());
         }
         if let Ok(mut m) = PAYLOADS.lock() {
             m.insert(poll_guid.to_uppercase(), payload.clone());
@@ -354,9 +417,36 @@ pub fn build_poll(creator: &str, question: &str, options: &[String]) -> anyhow::
     let suffix = format!("?src=p&c={}", pairs.len());
     let payload = poll_payload(creator, question, &pairs);
     let url = data_url(&payload, &suffix);
-    let balloon = Balloon {
+    let balloon = poll_balloon(url, &session);
+    let parts = breadcrumb_body();
+    let mut message = NormalMessage::new(String::new(), MessageType::IMessage);
+    message.xml = Some(parts.xml_string());
+    message.parts = parts;
+    message.app = Some(ExtensionApp {
+        name: POLLS_APP_NAME.to_string(),
+        app_id: None,
+        bundle_id: POLLS_BUNDLE_ID.to_string(),
+        balloon: Some(balloon),
+    });
+    Ok(BuiltPoll { message, payload, session, options: pairs })
+}
+
+fn breadcrumb_body() -> MessageParts {
+    MessageParts(vec![IndexedMessagePart {
+        part: MessagePart::Object(POLLS_BREADCRUMB.to_string()),
+        idx: None,
+        ext: None,
+    }])
+}
+
+/// The live Polls balloon. The creation and an option update carry the same
+/// one (capture 2026-10-28, poll-addoption-capture.log): template layout
+/// captioned "Sent a poll", icon, `["supports-polls"]`, `sendAsText`,
+/// `ld_text` "Sent a poll", live, the poll's session. Only the URL differs.
+fn poll_balloon(url: String, session: &str) -> Balloon {
+    Balloon {
         url,
-        session: Some(session.clone()),
+        session: Some(session.to_string()),
         layout: Some(BalloonLayout::TemplateLayout {
             image_subtitle: String::new(),
             image_title: String::new(),
@@ -371,22 +461,59 @@ pub fn build_poll(creator: &str, question: &str, options: &[String]) -> anyhow::
         icon: Some(b64(POLLS_ICON_B64)),
         required_capabilities: Some(b64(POLLS_REQUIRED_CAPABILITIES_B64)),
         send_as_text: Some(true),
+    }
+}
+
+pub struct BuiltOption {
+    pub react: ReactMessage,
+    pub option_id: String,
+    pub payload: Json,
+}
+
+/// An option added to an existing poll, as the iPhone sends it (capture
+/// 2026-10-28, 6FEFCC11 on poll 9BA72D50): a `React` on the poll guid with
+/// `Extension { is_meta: false }` (associated type 2), `to_part` None, the
+/// creation's live balloon carrying the extended payload, and a body of one
+/// `Object("Sent a poll")` part. `to_text` is not in the capture; it is
+/// empty, as on votes. The iPhone's icon was 2820 bytes; ours is the fork's
+/// 1462-byte icon, the same one our polls carry.
+pub fn build_add_option(
+    poll_guid: &str,
+    session: &str,
+    adder: &str,
+    prev: &Json,
+    text: &str,
+) -> anyhow::Result<BuiltOption> {
+    let session = uuid::Uuid::parse_str(session)
+        .map_err(|e| anyhow::anyhow!("poll session {session:?} is not a UUID: {e}"))?
+        .to_string();
+    let (payload, option_id, suffix) = extend_payload(prev, adder, text)?;
+    let balloon = poll_balloon(data_url(&payload, &suffix), &session);
+    let react = ReactMessage {
+        to_uuid: poll_guid.to_string(),
+        to_part: None,
+        reaction: ReactMessageType::Extension {
+            spec: ExtensionApp {
+                name: POLLS_APP_NAME.to_string(),
+                app_id: None,
+                bundle_id: POLLS_BUNDLE_ID.to_string(),
+                balloon: Some(balloon),
+            },
+            body: breadcrumb_body(),
+            is_meta: false,
+        },
+        to_text: String::new(),
+        embedded_profile: None,
     };
-    let parts = MessageParts(vec![IndexedMessagePart {
-        part: MessagePart::Object(POLLS_BREADCRUMB.to_string()),
-        idx: None,
-        ext: None,
-    }]);
-    let mut message = NormalMessage::new(String::new(), MessageType::IMessage);
-    message.xml = Some(parts.xml_string());
-    message.parts = parts;
-    message.app = Some(ExtensionApp {
-        name: POLLS_APP_NAME.to_string(),
-        app_id: None,
-        bundle_id: POLLS_BUNDLE_ID.to_string(),
-        balloon: Some(balloon),
-    });
-    Ok(BuiltPoll { message, payload, session, options: pairs })
+    Ok(BuiltOption { react, option_id, payload })
+}
+
+/// After a successful `poll_add_option` sent as `update_guid`: alias it to
+/// the poll and remember the new payload and options, as an inbound update
+/// would.
+pub fn register_update(poll_guid: &str, update_guid: &str, payload: &Json) {
+    add_alias(update_guid, poll_guid);
+    let _ = from_payload(payload, poll_guid, None, Json::Null);
 }
 
 fn plist_debug<T: serde::Serialize>(v: &T) -> String {
@@ -398,9 +525,7 @@ fn plist_debug<T: serde::Serialize>(v: &T) -> String {
 /// entry carrying the adder as `creatorHandle`, `canBeEdited: false`, and
 /// `attributedText` = `text`. Returns (payload, new option id, `?src=p&c=N`).
 ///
-/// Only the payload is established. The envelope of the update (associated
-/// type 2 vs 4000, layout, icon, capabilities, body, `to_part`) was not in
-/// the capture, so no `poll_add_option` command sends this yet.
+/// Sent by `build_add_option`.
 pub fn extend_payload(prev: &Json, adder: &str, text: &str) -> anyhow::Result<(Json, String, String)> {
     if text.trim().is_empty() {
         anyhow::bail!("option text must not be empty");
@@ -427,14 +552,14 @@ pub fn extend_payload(prev: &Json, adder: &str, text: &str) -> anyhow::Result<(J
 /// Record a poll we sent, so later votes on it resolve to option text.
 pub fn register_sent(poll_guid: &str, session: &str, options: Vec<(String, String)>, payload: Json) {
     if let Ok(mut m) = PAYLOADS.lock() {
-        m.insert(poll_guid.to_uppercase(), payload);
+        m.insert(canonical(poll_guid), payload);
     }
     remember(poll_guid, Some(session), Some(options));
 }
 
 /// Option ids known for a poll seen or sent since startup.
 pub fn option_ids_of(poll_guid: &str) -> Option<Vec<String>> {
-    OPTIONS.lock().ok()?.get(poll_guid).map(|v| v.iter().map(|(i, _)| i.clone()).collect())
+    OPTIONS.lock().ok()?.get(&canonical(poll_guid)).map(|v| v.iter().map(|(i, _)| i.clone()).collect())
 }
 
 /// A vote: `React` with `Extension { is_meta: true }` (associated type 4000)
@@ -727,6 +852,101 @@ mod tests {
         assert!(extend_payload(&ours, "x", "Fri").is_err());
         assert!(extend_payload(&ours, "x", " ").is_err());
         assert!(extend_payload(&json!({"item":{}}), "x", "a").is_err());
+    }
+
+    // poll-addoption-capture.log (2026-10-28): poll 9BA72D50 and the iPhone's
+    // option update 6FEFCC11 on it, same session.
+    const CAP2_CREATE: &str = "data:,eyJpdGVtIjp7InRpdGxlIjoiIiwiY3JlYXRvckhhbmRsZSI6IisxMjE1NTU0MTA1MCIsIm9yZGVyZWRQb2xsT3B0aW9ucyI6W3sib3B0aW9uSWRlbnRpZmllciI6IjFDMjNEOUU1LTM3OTQtNDA1Qi1BRTlCLTE4QTQ2NUFBMzU5NyIsInRleHQiOiJ0ZXN0IiwiY3JlYXRvckhhbmRsZSI6IisxMjE1NTU0MTA1MCIsImF0dHJpYnV0ZWRUZXh0IjoidGVzdCIsImNhbkJlRWRpdGVkIjpmYWxzZX0seyJvcHRpb25JZGVudGlmaWVyIjoiQTk4M0FDODMtNkIxNy00RDg4LTgwMTEtNjk2RERFMTczQ0M4IiwidGV4dCI6InRlc3QiLCJjcmVhdG9ySGFuZGxlIjoiKzEyMTU1NTQxMDUwIiwiYXR0cmlidXRlZFRleHQiOiJ0ZXN0IiwiY2FuQmVFZGl0ZWQiOmZhbHNlfV19LCJ2ZXJzaW9uIjoxfQ==?src=p&c=2";
+    const CAP2_ADDED: &str = "data:,eyJ2ZXJzaW9uIjoxLCJpdGVtIjp7Im9yZGVyZWRQb2xsT3B0aW9ucyI6W3siYXR0cmlidXRlZFRleHQiOiJ0ZXN0Iiwib3B0aW9uSWRlbnRpZmllciI6IjFDMjNEOUU1LTM3OTQtNDA1Qi1BRTlCLTE4QTQ2NUFBMzU5NyIsImNyZWF0b3JIYW5kbGUiOiIrMTIxNTU1NDEwNTAiLCJ0ZXh0IjoidGVzdCIsImNhbkJlRWRpdGVkIjpmYWxzZX0seyJjYW5CZUVkaXRlZCI6ZmFsc2UsIm9wdGlvbklkZW50aWZpZXIiOiJBOTgzQUM4My02QjE3LTREODgtODAxMS02OTZEREUxNzNDQzgiLCJjcmVhdG9ySGFuZGxlIjoiKzEyMTU1NTQxMDUwIiwidGV4dCI6InRlc3QiLCJhdHRyaWJ1dGVkVGV4dCI6InRlc3QifSx7ImNhbkJlRWRpdGVkIjpmYWxzZSwib3B0aW9uSWRlbnRpZmllciI6IjE3QjcyNDE5LThGQjktNDJFQS1CRTgwLUFBQTE2ODk1QjE5NSIsImNyZWF0b3JIYW5kbGUiOiIrMTIxNTU1NDEwNTAiLCJ0ZXh0IjoiYWRkZWQgY2hvaWNlIiwiYXR0cmlidXRlZFRleHQiOiJhZGRlZCBjaG9pY2UifV0sImNyZWF0b3JIYW5kbGUiOiIrMTIxNTU1NDEwNTAiLCJ0aXRsZSI6IiJ9fQ==?src=p&c=3";
+    const CAP2_SESSION: &str = "ca2c0618-d27f-4208-8974-e2f9ae347fc0";
+    const CAP2_POLL: &str = "9BA72D50-758D-4712-9FF0-C372BDEE0CA6";
+
+    #[test]
+    fn add_option_matches_captured_envelope() {
+        from_payload(&decode_url(CAP2_CREATE).unwrap(), CAP2_POLL, None, Json::Null);
+        let base = payload_of(CAP2_POLL).unwrap();
+        let b = build_add_option(CAP2_POLL, CAP2_SESSION, "tel:+12155541050", &base, "added choice").unwrap();
+        let r = &b.react;
+        assert_eq!(r.to_uuid, CAP2_POLL);
+        assert_eq!(r.to_part, None); // to_part=None
+        assert_eq!(r.to_text, "");
+        let ReactMessageType::Extension { spec, body, is_meta } = &r.reaction else { panic!() };
+        assert!(!*is_meta); // rustpush: is_meta false -> associated type 2
+        assert_eq!(spec.name, "Polls");
+        assert_eq!(spec.bundle_id, POLLS_BUNDLE_ID);
+        assert_eq!(spec.app_id, None); // adam_id=None
+        assert_eq!(serde_json::to_string(body).unwrap(), r#"[{"part":{"Object":"Sent a poll"},"idx":null,"ext":null}]"#);
+        let bl = spec.balloon.as_ref().unwrap();
+        assert!(bl.is_live);
+        assert_eq!(bl.session.as_deref(), Some(CAP2_SESSION));
+        assert_eq!(bl.send_as_text, Some(true));
+        assert_eq!(bl.ld_text.as_deref(), Some("Sent a poll"));
+        assert_eq!(
+            general_purpose::STANDARD.encode(bl.required_capabilities.as_ref().unwrap()),
+            POLLS_REQUIRED_CAPABILITIES_B64 // identical to captured caps_b64
+        );
+        assert!(bl.icon.is_some()); // captured 2820 bytes; ours differs, see build_add_option
+        let layout = format!("{:?}", plist::to_value(bl.layout.as_ref().unwrap()).unwrap());
+        assert_eq!(
+            layout,
+            r#"Dictionary({"layoutClass": String("MSMessageTemplateLayout"), "userInfo": Dictionary({"image-subtitle": String(""), "image-title": String(""), "caption": String("Sent a poll"), "secondary-subcaption": String(""), "tertiary-subcaption": String(""), "subcaption": String(""), "$class": String("NSDictionary")})})"#
+        );
+        assert!(bl.url.ends_with("?src=p&c=3") && CAP2_ADDED.ends_with("?src=p&c=3"));
+        let mut cap = decode_url(CAP2_ADDED).unwrap();
+        cap["item"]["orderedPollOptions"][2]["optionIdentifier"] = json!(b.option_id);
+        assert_eq!(decode_url(&bl.url).unwrap(), cap);
+        assert_eq!(b.payload, cap);
+        // Survives rustpush's balloon encoding.
+        let (_ati, bp) = spec.to_raw(false).unwrap();
+        let back = ExtensionApp::from_bp(&bp.unwrap(), POLLS_BUNDLE_ID).unwrap().balloon.unwrap();
+        assert_eq!(back.url, bl.url);
+        assert!(back.is_live);
+        assert_eq!(back.session.unwrap().to_lowercase(), CAP2_SESSION);
+        // The option map updates.
+        register_update(CAP2_POLL, "6FEFCC11-8F25-4C38-AD4D-EFAB78142C1D", &b.payload);
+        let ids = option_ids_of(CAP2_POLL).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[2], b.option_id);
+        assert!(build_add_option(CAP2_POLL, "nope", "x", &base, "y").is_err());
+    }
+
+    /// Live 2026-10-28: we sent poll 685B5F39, then poll_add_option as
+    /// D79A3D71 adding "Thursday"; the iPhone's vote on Thursday targeted
+    /// D79A3D71. It must resolve to the poll and to the option text.
+    #[test]
+    fn vote_on_update_guid_resolves_to_poll() {
+        const POLL: &str = "685B5F39-F505-46CE-B04B-EE226BF981CE";
+        const UPDATE: &str = "D79A3D71-B8E3-4506-BA06-94A718C5B0F5";
+        let b = build_poll("mailto:agent@groupg.net", "Day?", &["Tue".into(), "Wed".into()]).unwrap();
+        register_sent(POLL, &b.session, b.options.clone(), b.payload.clone());
+        let base = payload_of(POLL).unwrap();
+        let add = build_add_option(POLL, &b.session, "mailto:agent@groupg.net", &base, "Thursday").unwrap();
+        register_update(POLL, UPDATE, &add.payload);
+        assert_eq!(canonical(&UPDATE.to_lowercase()), POLL);
+        assert_eq!(latest_of(POLL), UPDATE);
+        assert_eq!(session_of(UPDATE).as_deref(), Some(b.session.as_str()));
+        assert_eq!(option_ids_of(UPDATE).unwrap().len(), 3);
+        assert_eq!(payload_of(UPDATE).unwrap(), add.payload);
+        // The iPhone's vote, aimed at the update guid.
+        let vote = vote_payload("tel:+12155541050", &[add.option_id.clone()]);
+        let ev = from_payload(&vote, UPDATE, Some("tel:+12155541050"), Json::Null);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["poll_guid"], POLL);
+        assert_eq!(ev[0]["option"], "Thursday");
+        assert_eq!(ev[0]["option_known"], true);
+        assert_eq!(ev[0]["selected"][0]["option"], "Thursday");
+        assert_eq!(ev[0]["sender"], "tel:+12155541050");
+        // A second update aimed at the first chains to the poll, and its
+        // re-emitted poll event names the poll.
+        let add2 = build_add_option(UPDATE, &b.session, "tel:+12155541050", &payload_of(UPDATE).unwrap(), "Fri").unwrap();
+        add_alias("SECOND-UPDATE", UPDATE);
+        let pe = from_payload(&add2.payload, "SECOND-UPDATE", None, Json::Null);
+        assert_eq!(pe[0]["event"], "poll");
+        assert_eq!(pe[0]["guid"], POLL);
+        assert_eq!(pe[0]["options"], json!(["Tue", "Wed", "Thursday", "Fri"]));
+        // Our vote, given any alias, targets the newest message.
+        let r = build_vote(&latest_of(UPDATE), &b.session, "x", &[]).unwrap();
+        assert_eq!(r.to_uuid, "SECOND-UPDATE");
     }
 
     #[test]

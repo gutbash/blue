@@ -235,13 +235,41 @@
 //! received since the helper started. Ids not on a known poll are rejected.
 //! [VERIFY on a device]
 //!
-//! **Adding a poll option is not a command yet.** `poll::extend_payload`
-//! builds the extended payload and matches the captured iPhone add-option
-//! payload exactly, apart from the new UUID. The update's *envelope* is not
-//! established: the capture logged no associated type (2 or 4000), layout,
-//! icon, capabilities, body or part, and the sbaresearch fork has no update
-//! sender. Every extension balloon now also logs `extension envelope on …`
-//! with those fields; one captured add-option from an iPhone settles it.
+//! **Update guids are aliases of the poll.** Once an option is added, iOS
+//! aims later votes at the newest update message, not at the poll (seen
+//! live 2026-10-28). The helper maps every update guid to its original poll
+//! guid: on our own `poll_add_option`, and on any received type-2 update
+//! carrying `orderedPollOptions`, chaining through earlier updates. Events
+//! always report the original guid (`poll.guid`, `poll_vote.poll_guid`), and
+//! `poll_vote` / `poll_add_option` accept either guid. `poll_vote` sends to
+//! the poll's newest message, as the iPhone did, and its reply adds
+//! `poll_guid` (original) and `target_guid` (where the vote went).
+//! `poll_add_option` stays associated to the original poll, as captured.
+//! A received update aliases even when its poll is unknown here. Aliases
+//! are in memory only.
+//!
+//! `poll_add_option` -> `{"guid","chat_guid","option_id":"<UUID>","poll_guid"}`
+//!
+//!     {"cmd":"poll_add_option","chat":{...},"poll_guid":"<guid>",
+//!      "text":"Fri","session":"<UUID, optional>"}
+//!
+//! Appends one option with a new UUID and our handle (bare) as its
+//! `creatorHandle`. The base is the newest full poll payload seen or sent
+//! since the helper started; an unknown poll is refused. `session` defaults
+//! to the remembered one. Empty text, or text equal to an existing option,
+//! is refused (the iPhone itself allowed two options both named "test").
+//! The option map updates on success, so votes on the new option resolve.
+//! Envelope, from an iPhone capture (2026-10-28,
+//! poll-addoption-capture.log): a `React` on the poll guid with
+//! `Extension { is_meta: false }` (associated type 2), `to_part` none, a
+//! body of one `Object("Sent a poll")` part, and the creation's balloon
+//! repeated: `MSMessageTemplateLayout` captioned "Sent a poll", the
+//! `["supports-polls"]` capabilities, `sendAsText`, `ld_text` "Sent a poll",
+//! live, same session, with the URL carrying the full extended
+//! `orderedPollOptions` and `?src=p&c=<count>`. Two differences from the
+//! capture: our icon is the fork's 1462-byte JPEG where the iPhone's was
+//! 2820 bytes (only its size was logged), and `to_text` is empty (not in the
+//! capture). [VERIFY on a device that iOS shows the added option]
 //!
 //! `set_participants` -> `{"guid","chat_guid"}`:
 //! `{"cmd":"set_participants","chat":{...},"participants":[...],"group_version":0}`
@@ -297,17 +325,37 @@
 //!
 //! `set_background` -> `{"guid","chat_guid","version":n,"cleared":bool,"poster":"photo|…"|null}`
 //!
-//!     {"cmd":"set_background","chat":{...,"guid":"<chat guid>"},"path":"C:\\abs\\bg.zip"}
-//!     {"cmd":"set_background","chat":{...,"guid":"<chat guid>"},"version":4}
+//!     {"cmd":"set_background","chat":{...,"guid":"<chat guid>"},"image_path":"C:\\abs\\site.jpg"}
+//!     {"cmd":"set_background","chat":{...},"gradient":{"colors":["#DCD2F2",[0.23,0.69,0.93]]}}
+//!     {"cmd":"set_background","chat":{...},"dynamic":"ocean_2"}
+//!     {"cmd":"set_background","chat":{...},"path":"C:\\abs\\bg.zip"}
+//!     {"cmd":"set_background","chat":{...,"guid":"<chat guid>"},"version":4}   // clear
 //!
-//! IDS command 138, `Message::SetTranscriptBackground`. Without `path` the
-//! background is cleared. With `path` the file is uploaded to MMCS, as
-//! `set_icon` does, and sent as the new background. **The file must be a
-//! transcript-background payload, not an image.** iOS's is a zip of a
-//! PosterKit archive plus a watch preview, and `.jpg`/`.png`/`.heic`/`.gif`
-//! are refused. Use a payload saved with `download_background`. `cid` is
-//! set to `chat.guid`. `version` (`tbid`) defaults to one past the newest
-//! seen or sent for that chat, else 1. [VERIFY both on a device]
+//! IDS command 138, `Message::SetTranscriptBackground`. At most one source;
+//! none clears. The payload is uploaded to MMCS, as `set_icon` does.
+//! iOS's payload is a zip: `watchBackground` (a plist with `isHighKey`,
+//! `luminance`, an 820x1003 PNG preview, `extensionIdentifier`) and
+//! `poster` (a PosterKit archive). `src/bgbuild.rs` builds it from
+//! templates captured from an iPhone (`assets/bg/`):
+//! - `image_path`: any JPEG, PNG or HEIC. It is cropped to fill the
+//!   template's 1292x2796 portrait layer and encoded to HEIC by
+//!   `assets/bg/prep_photo.py` (Pillow + pillow-heif; `GROUPG_PYTHON`
+//!   picks the interpreter). The watch preview, `luminance`, `isHighKey`
+//!   and `Contents.json` `clockAreaLuminance` are recomputed from it. All
+//!   frames are kept, since they refer to the layer's size. Every UUID is
+//!   fresh (configuration, poster identifier, suggestion, and the asset id
+//!   that names the contents folder).
+//! - `gradient.colors`: exactly two, `"#RRGGBB[AA]"` or `[r,g,b(,a)]` in
+//!   0..1, written as `userInfo.custom` `r/g/b/a//r/g/b/a`.
+//! - `dynamic`: `aurora_2`, `clouds_2` or `ocean_2`, the three presets
+//!   captured (`userInfo.identifier`), each with Apple's own preview.
+//! - `path`: a ready payload, e.g. one saved with `download_background`.
+//!   Images are refused here; use `image_path`.
+//!
+//! `cid` is `chat.guid`. `version` (`tbid`) defaults to one past the newest
+//! seen or sent for that chat, else 1. [VERIFY on a device: that iOS shows
+//! our builds; the derived luminances and the watch crop are best fits, not
+//! Apple's formulas; the gradient preview direction]
 //!
 //! `download_background` -> `{"path","bytes","preview":"<path>"|null,"poster":"…"|null}`:
 //! `{"cmd":"download_background","guid":"<background msg guid>","dest":"C:\\abs\\bg.zip"}`.
@@ -450,6 +498,7 @@
 
 mod compose;
 mod background;
+mod bgbuild;
 mod focus;
 mod link;
 mod migrate;
@@ -674,6 +723,14 @@ enum Command {
         #[serde(default)]
         session: Option<String>,
     },
+    /// Add an option to an existing poll, as an iPhone does.
+    PollAddOption {
+        chat: ChatRef,
+        poll_guid: String,
+        text: String,
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// Send a URL as a rich link card; see `link.rs`.
     SendLink {
         chat: ChatRef,
@@ -701,8 +758,17 @@ enum Command {
     /// Set (`path`) or clear (no `path`) a chat background.
     SetBackground {
         chat: ChatRef,
+        /// A ready transcript-background payload (zip).
         #[serde(default)]
         path: Option<String>,
+        /// Any JPEG, PNG or HEIC; built into a photo background.
+        #[serde(default)]
+        image_path: Option<String>,
+        #[serde(default)]
+        gradient: Option<GradientSpec>,
+        /// A captured dynamic preset: aurora_2, clouds_2, ocean_2.
+        #[serde(default)]
+        dynamic: Option<String>,
         #[serde(default)]
         version: Option<u64>,
     },
@@ -716,6 +782,12 @@ enum Command {
         #[serde(default)]
         group_version: u64,
     },
+}
+
+/// `set_background` gradient: two colors, `"#RRGGBB"` or `[r,g,b(,a)]` in 0..1.
+#[derive(Deserialize)]
+struct GradientSpec {
+    colors: Vec<Json>,
 }
 
 /// A local file to send. `mime` and `uti` default from the extension.
@@ -1046,6 +1118,8 @@ impl Session {
             }
 
             Command::PollVote { chat, poll_guid, option_ids, session } => {
+                // An update guid names the same poll.
+                let poll_guid = poll::canonical(&poll_guid);
                 let session = session
                     .or_else(|| poll::session_of(&poll_guid))
                     .ok_or_else(|| anyhow!(
@@ -1056,8 +1130,33 @@ impl Session {
                         bail!("option {bad} is not on poll {poll_guid}");
                     }
                 }
-                let vote = poll::build_vote(&poll_guid, &session, self.my_handle()?, &option_ids)?;
-                self.send(chat, Message::React(vote)).await
+                // iOS votes on the poll's newest message (an update, once an
+                // option has been added); see poll::latest_of.
+                let target = poll::latest_of(&poll_guid);
+                let vote = poll::build_vote(&target, &session, self.my_handle()?, &option_ids)?;
+                let mut reply = self.send(chat, Message::React(vote)).await?;
+                reply["poll_guid"] = json!(poll_guid);
+                reply["target_guid"] = json!(target);
+                Ok(reply)
+            }
+
+            Command::PollAddOption { chat, poll_guid, text, session } => {
+                let poll_guid = poll::canonical(&poll_guid);
+                let session = session
+                    .or_else(|| poll::session_of(&poll_guid))
+                    .ok_or_else(|| anyhow!(
+                        "poll {poll_guid} has not been seen since the helper started; pass `session`"
+                    ))?;
+                let base = poll::payload_of(&poll_guid).ok_or_else(|| anyhow!(
+                    "the options of poll {poll_guid} are not known (not seen since the helper started)"
+                ))?;
+                let built = poll::build_add_option(&poll_guid, &session, self.my_handle()?, &base, &text)?;
+                let mut reply = self.send(chat, Message::React(built.react)).await?;
+                let update_guid = reply["guid"].as_str().unwrap_or_default().to_string();
+                poll::register_update(&poll_guid, &update_guid, &built.payload);
+                reply["poll_guid"] = json!(poll_guid);
+                reply["option_id"] = json!(built.option_id);
+                Ok(reply)
             }
 
             Command::Edit {
@@ -1264,26 +1363,60 @@ impl Session {
                 Ok(f.query(&handles).await)
             }
 
-            Command::SetBackground { chat, path, version } => {
+            Command::SetBackground { chat, path, image_path, gradient, dynamic, version } => {
                 // `cid` = the chat guid. [VERIFY that iOS keys it the same way]
                 let chat_id = chat.guid.clone();
+                let given = [path.is_some(), image_path.is_some(), gradient.is_some(), dynamic.is_some()]
+                    .iter()
+                    .filter(|b| **b)
+                    .count();
+                if given > 1 {
+                    bail!("set_background takes one of `path`, `image_path`, `gradient`, `dynamic` (none clears)");
+                }
+                // Build first, so a bad image costs no upload.
+                let built: Option<(Vec<u8>, &str)> = if let Some(img) = &image_path {
+                    let img = img.clone();
+                    let (heic, png, d) = tokio::task::spawn_blocking(move || bgbuild::prep_photo(&img))
+                        .await
+                        .map_err(|e| anyhow!("photo prep task: {e}"))??;
+                    Some((bgbuild::build_photo(heic, png, d)?, "photo"))
+                } else if let Some(g) = &gradient {
+                    let colors = g.colors.iter().map(bgbuild::parse_color).collect::<Result<Vec<_>>>()?;
+                    Some((bgbuild::build_gradient(&colors)?, "gradient"))
+                } else if let Some(p) = &dynamic {
+                    Some((bgbuild::build_dynamic(p)?, "dynamic"))
+                } else {
+                    None
+                };
+                let tmp = std::env::temp_dir().join(format!("ib-bg-{}.zip", uuid::Uuid::new_v4()));
+                let upload_path = match (&built, &path) {
+                    (Some((bytes, _)), _) => {
+                        std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+                        Some(tmp.display().to_string())
+                    }
+                    (None, Some(p)) => Some(p.clone()),
+                    (None, None) => None,
+                };
+                let kind = match (&built, &path) {
+                    (Some((_, k)), _) => Some(k.to_string()),
+                    (None, Some(p)) => Some(background::validate_payload(p)?),
+                    _ => None,
+                };
                 let version = background::next_version(chat_id.as_deref(), version);
-                let (file, kind) = match &path {
-                    None => (None, None),
+                let file = match &upload_path {
+                    None => None,
                     Some(p) => {
-                        let kind = background::validate_payload(p)?;
-                        let f = self
-                            .upload_mmcs(id.as_deref(), 0, 1, p)
-                            .await
-                            .with_context(|| format!("uploading background {p}"))?;
-                        (Some(f), Some(kind))
+                        let r = self.upload_mmcs(id.as_deref(), 0, 1, p).await;
+                        let _ = std::fs::remove_file(&tmp);
+                        Some(r.with_context(|| format!("uploading background {p}"))?)
                     }
                 };
+                let cleared = file.is_none();
                 let msg = background::build(file, version, chat_id.clone());
                 let mut r = self.send(chat, Message::SetTranscriptBackground(msg)).await?;
                 background::note_version(chat_id.as_deref(), version);
                 r["version"] = json!(version);
-                r["cleared"] = json!(path.is_none());
+                r["cleared"] = json!(cleared);
                 r["poster"] = json!(kind);
                 Ok(r)
             }
@@ -2274,6 +2407,10 @@ mod wire_tests {
         assert!(matches!(parse(r#"{"cmd":"focus_status"}"#), Command::FocusStatus { .. }));
         assert!(matches!(parse(r#"{"cmd":"set_background","chat":{"participants":["tel:+1"],"guid":"G"}}"#), Command::SetBackground { path: None, version: None, .. }));
         assert!(matches!(parse(r#"{"cmd":"set_background","chat":{"participants":["tel:+1"]},"path":"C:\\b.zip","version":3}"#), Command::SetBackground { path: Some(_), version: Some(3), .. }));
+        assert!(matches!(parse(r#"{"cmd":"poll_add_option","chat":{"participants":["tel:+1"]},"poll_guid":"G","text":"Fri"}"#), Command::PollAddOption { session: None, .. }));
         assert!(matches!(parse(r#"{"cmd":"download_background","guid":"G","dest":"C:\\b.zip"}"#), Command::DownloadBackground { .. }));
+        assert!(matches!(parse(r#"{"cmd":"set_background","chat":{"participants":["tel:+1"]},"image_path":"C:\\p.heic"}"#), Command::SetBackground { image_path: Some(_), .. }));
+        assert!(matches!(parse(r##"{"cmd":"set_background","chat":{"participants":["tel:+1"]},"gradient":{"colors":["#DCD2F2",[0.2,0.7,0.9]]}}"##), Command::SetBackground { gradient: Some(_), .. }));
+        assert!(matches!(parse(r#"{"cmd":"set_background","chat":{"participants":["tel:+1"]},"dynamic":"ocean_2"}"#), Command::SetBackground { dynamic: Some(_), .. }));
     }
 }
