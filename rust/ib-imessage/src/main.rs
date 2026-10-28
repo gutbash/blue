@@ -266,6 +266,40 @@
 //! `total` is MMCS's count and includes encryption overhead, so it can differ
 //! slightly from the file size. Advisory only: the reply is the result.
 //!
+//! **Native polls (iOS 26), inbound only.** A poll arrives as an ordinary
+//! `message` event whose `Message.app.bundle_id` ends in
+//! `com.apple.messages.Polls`; a vote arrives as a `React` with an
+//! `Extension` reaction (associated type 4000) whose `to_uuid` is the poll.
+//! The raw `message` event is always sent; these follow it:
+//!
+//!     {"event":"poll","guid":"<poll message guid>","chat":<ConversationData>|null,
+//!      "question":"…","creator":"<handle>"|null,
+//!      "options":["…",…],"option_ids":["<UUID>",…]}
+//!     {"event":"poll_vote","poll_guid":"<guid>","chat":…,"voter":"<handle>"|null,
+//!      "option":"<text, or the option id if the poll is unknown>",
+//!      "option_id":"<UUID>","option_known":bool,
+//!      "selected":[{"option_id":"<UUID>","option":"…"|null},…]}
+//!
+//! - `question` is often `""`: iOS can show the question as a separate text
+//!   message replying to the poll (per openclaw/imsg). Read the next message
+//!   with `reply_guid` = the poll guid if it is empty.
+//! - A vote payload is the voter's whole current selection. One `poll_vote`
+//!   is emitted per selected option, each carrying the full `selected` list;
+//!   consumers should *replace* that voter's selection with `selected`. An
+//!   empty selection (vote withdrawn) emits one `poll_vote` with
+//!   `option`/`option_id` null and `selected: []`. [VERIFY on a device]
+//! - Option texts are remembered only for polls seen since the helper
+//!   started; votes on older polls carry `option_known: false`.
+//! - Handles inside the poll payload (`creator`, `voter`) are as iOS writes
+//!   them (`+1…` or an email), without the `tel:`/`mailto:` prefix.
+//! - A type-2 update that carries the option list (an option was added) is
+//!   re-emitted as `poll` with the original guid.
+//! - rustpush does not serialise `ExtensionApp.balloon`, so the poll URL is
+//!   *not* in `inst`. Every extension balloon is logged at info level as
+//!   `extension balloon on <guid> … bid=… url=…` for capture and debugging.
+//! There is no `send_poll`: the outbound wire format is not confirmed.
+//! Format and sources: `src/poll.rs`.
+//!
 //! `{"event":"parse_error","error":"<rustpush error>"}` — an APNs message that
 //! rustpush could not parse.
 //!
@@ -286,6 +320,7 @@
 
 mod compose;
 mod migrate;
+mod poll;
 mod profile;
 mod setprofile;
 mod state;
@@ -1338,6 +1373,11 @@ fn publish(session: &Session, inst: MessageInst) {
             let line = json!({"event": "message", "inst": inst_json}).to_string();
             // An error here only means nobody is listening yet.
             let _ = session.events.send(line);
+            // Derived events follow the raw one; see poll.rs.
+            for ev in poll::events_for(&inst) {
+                log::info!("poll event: {ev}");
+                let _ = session.events.send(ev.to_string());
+            }
         }
         Err(e) => log::warn!("could not serialise message {}: {e}", inst.id),
     }
