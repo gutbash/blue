@@ -210,6 +210,14 @@ pub fn registration_age(users: &[IDSUser]) -> HashMap<String, u64> {
     out
 }
 
+#[cfg(not(unix))]
+fn restrict_permissions(_dir: &Path) -> Result<()> {
+    // No mode bits on Windows. The state dir inherits the ACL of its parent;
+    // keep it under the user profile so only that account can read it.
+    Ok(())
+}
+
+#[cfg(unix)]
 fn restrict_permissions(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;

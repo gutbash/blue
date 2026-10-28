@@ -74,8 +74,11 @@ fn persist(path: &Path, state: &SoftwareKeystoreState) -> Result<()> {
     let tmp = path.with_extension("tmp");
     plist::to_file_binary(&tmp, state).context("serializing keystore")?;
     std::fs::rename(&tmp, path).context("replacing keystore")?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 

@@ -24,6 +24,9 @@ base64 = "0.21"
 log = "0.4"
 pretty_env_logger = "0.5"
 anyhow = "1"
+# Square-crop and re-encode the set_profile photo. JPEG/PNG only, to keep the
+# dependency small.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [[bin]]
 name = "ib-imessage"
@@ -34,3 +37,9 @@ path = "src/main.rs"
 # builds over aggressive optimisation we'd never notice.
 opt-level = 2
 lto = "thin"
+
+# [patch] only applies at the workspace root, so rustpush's own quinn patch is
+# ignored when this crate is the root; without it h3-quinn and rustpush see two
+# different `quinn::Connection` types.
+[patch.crates-io]
+quinn = { path = "../rustpush/third_party/quinn/quinn" }
