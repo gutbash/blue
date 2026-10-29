@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rustpush::{
-    IndexedMessagePart, LPImageMetadata, LPLinkMetadata, LinkMeta, Message, MessageInst,
+    IndexedMessagePart, LPIconMetadata, LPImageMetadata, LPLinkMetadata, LinkMeta, Message, MessageInst,
     MessagePart, MessageParts, MessageType, NSURL, NormalMessage,
     RichLinkImageAttachmentSubstitute,
 };
@@ -132,6 +132,19 @@ impl CardImage {
         let img = image::load_from_memory(&bytes).context("decoding preview image")?;
         Ok(Self { mime: mime.into(), width: img.width(), height: img.height(), bytes, source_url })
     }
+
+    /// For a fetched site icon: JPEG or PNG as is, an ICO decoded (largest
+    /// entry) and re-encoded as PNG. SVG and anything else is rejected.
+    pub fn icon_from_bytes(bytes: Vec<u8>, source_url: Option<String>) -> Result<Self> {
+        if image::guess_format(&bytes).ok() == Some(image::ImageFormat::Ico) {
+            let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Ico)
+                .context("decoding ICO icon")?;
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).context("re-encoding ICO as PNG")?;
+            return Self::from_bytes(out.into_inner(), source_url);
+        }
+        Self::from_bytes(bytes, source_url)
+    }
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -140,12 +153,33 @@ pub struct Card {
     pub summary: Option<String>,
     pub site_name: Option<String>,
     pub image_url: Option<String>,
+    /// Site icon candidates in preference order: `apple-touch-icon`, then
+    /// `<link rel="icon">`, then `/favicon.ico`. Filled by `parse_og`.
+    pub icon_urls: Vec<String>,
 }
 
 /// Build the link message. The text body is the URL itself, as iOS sends it,
 /// so a client that ignores the balloon still shows a tappable link.
-pub fn build(url: &str, card: &Card, image: Option<CardImage>) -> NormalMessage {
-    let mut attachments = Vec::new();
+///
+/// `image` fills the big preview slot and `icon` the small icon slot; each is
+/// its own attachment, image at index 0 and icon after it (0 or 1). With
+/// `compact` there is no big image: if no icon was given, the image moves to
+/// the icon slot (iOS then draws the small card), otherwise it is dropped.
+pub fn build(url: &str, card: &Card, image: Option<CardImage>, icon: Option<CardImage>, compact: bool) -> NormalMessage {
+    let (image, icon) = match (compact, image, icon) {
+        (true, img, None) => (None, img),
+        (true, _, ic) => (None, ic),
+        (false, img, ic) => (img, ic),
+    };
+    let mut attachments: Vec<Vec<u8>> = Vec::new();
+    let mut sub = |img: CardImage| {
+        let s = RichLinkImageAttachmentSubstitute {
+            mime_type: img.mime.clone(),
+            rich_link_image_attachment_substitute_index: attachments.len() as _,
+        };
+        attachments.push(img.bytes);
+        s
+    };
     let (image_sub, image_meta) = match image {
         Some(img) => {
             let meta = LPImageMetadata {
@@ -153,26 +187,28 @@ pub fn build(url: &str, card: &Card, image: Option<CardImage>) -> NormalMessage 
                 url: nsurl(img.source_url.as_deref().unwrap_or(url)),
                 version: 1,
             };
-            let sub = RichLinkImageAttachmentSubstitute {
-                mime_type: img.mime.clone(),
-                rich_link_image_attachment_substitute_index: 0,
-            };
-            attachments.push(img.bytes);
-            (Some(sub), Some(meta))
+            (Some(sub(img)), Some(meta))
+        }
+        None => (None, None),
+    };
+    let (icon_sub, icon_meta) = match icon {
+        Some(ic) => {
+            let meta = LPIconMetadata { url: nsurl(ic.source_url.as_deref().unwrap_or(url)), version: 1 };
+            (Some(sub(ic)), Some(meta))
         }
         None => (None, None),
     };
     let data = LPLinkMetadata {
         image_metadata: image_meta,
         version: 1,
-        icon_metadata: None,
+        icon_metadata: icon_meta,
         original_url: Some(nsurl(url)),
         url: Some(nsurl(url)),
         title: card.title.clone(),
         summary: card.summary.clone(),
         site_name: card.site_name.clone(),
         image: image_sub,
-        icon: None,
+        icon: icon_sub,
         images: None,
         icons: None,
         is_incomplete: None,
@@ -280,6 +316,30 @@ pub fn parse_og(html: &str, base: &str) -> Card {
     if card.summary.is_none() {
         card.summary = desc;
     }
+    let (mut touch, mut plain_icons) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while let Some(p) = lower[i..].find("<link") {
+        let start = i + p;
+        let end = lower[start..].find('>').map(|e| start + e).unwrap_or(lower.len());
+        let tag = &html[start..end];
+        i = end.max(start + 5);
+        let (Some(rel), Some(href)) = (attr(tag, "rel"), attr(tag, "href").filter(|h| !h.is_empty())) else { continue };
+        let rel = rel.to_ascii_lowercase();
+        let rels: Vec<&str> = rel.split_whitespace().collect();
+        let href = absolutize(&href, base);
+        if rels.iter().any(|r| r.starts_with("apple-touch-icon")) {
+            touch.push(href);
+        } else if rels.contains(&"icon") {
+            plain_icons.push(href);
+        }
+    }
+    card.icon_urls = touch;
+    card.icon_urls.extend(plain_icons);
+    card.icon_urls.retain(|u| !u.to_ascii_lowercase().split(['?', '#']).next().unwrap_or("").ends_with(".svg"));
+    let fav = absolutize("/favicon.ico", base);
+    if !card.icon_urls.contains(&fav) {
+        card.icon_urls.push(fav);
+    }
     if card.title.is_none() {
         if let (Some(a), Some(b)) = (lower.find("<title"), lower.find("</title>")) {
             if let Some(gt) = lower[a..].find('>') {
@@ -331,9 +391,19 @@ async fn get_capped(client: &reqwest::Client, url: &str, cap: usize) -> Result<V
     Ok(out)
 }
 
-/// Fetch the page and, if named, its og:image. Every request is bounded by a
-/// 5 s timeout and a size cap.
-pub async fn fetch(url: &str) -> Result<(Card, Option<Vec<u8>>)> {
+/// What `fetch` found: the parsed card, the og:image bytes, and the first
+/// site icon that decoded (JPEG, PNG, or ICO re-encoded as PNG).
+pub struct Fetched {
+    pub card: Card,
+    pub image: Option<Vec<u8>>,
+    pub icon: Option<CardImage>,
+}
+
+/// Fetch the page and, if named, its og:image; with `want_icon`, also the
+/// site icon, trying the first four of `Card::icon_urls` until one decodes.
+/// SVG icons are skipped (the `image` crate cannot decode them). Every
+/// request is bounded by a 5 s timeout and a size cap.
+pub async fn fetch(url: &str, want_icon: bool) -> Result<Fetched> {
     let client = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(4))
@@ -350,7 +420,20 @@ pub async fn fetch(url: &str) -> Result<(Card, Option<Vec<u8>>)> {
         },
         None => None,
     };
-    Ok((card, image))
+    let mut icon = None;
+    if want_icon {
+        for u in card.icon_urls.iter().take(4) {
+            match get_capped(&client, u, MAX_IMAGE + 1).await {
+                Ok(b) if b.len() <= MAX_IMAGE => match CardImage::icon_from_bytes(b, Some(u.clone())) {
+                    Ok(i) => { icon = Some(i); break; }
+                    Err(e) => log::info!("icon {u}: {e:#}"),
+                },
+                Ok(_) => log::info!("icon {u} over {MAX_IMAGE} bytes; skipped"),
+                Err(e) => log::info!("icon {u}: {e:#}"),
+            }
+        }
+    }
+    Ok(Fetched { card, image, icon })
 }
 
 #[cfg(test)]
@@ -379,9 +462,10 @@ mod tests {
             summary: Some("Zoning summary".into()),
             site_name: Some("Atlas".into()),
             image_url: None,
+            ..Default::default()
         };
         let img = CardImage::from_bytes(png(40, 20), Some("https://x.example/i.png".into())).unwrap();
-        let m = build("https://atlas.phila.gov/2824", &card, Some(img));
+        let m = build("https://atlas.phila.gov/2824", &card, Some(img), None, false);
         assert_eq!(m.parts.raw_text(), "https://atlas.phila.gov/2824");
         let lm = m.link_meta.as_ref().unwrap();
         assert_eq!(lm.attachments.len(), 1);
@@ -402,7 +486,7 @@ mod tests {
     fn metadata_survives_keyed_archive() {
         // The same encoding rustpush applies on send (KeyedArchive of
         // RichLink), and the same expansion it applies on receive.
-        let m = build("https://example.com/a", &Card { title: Some("T".into()), site_name: Some("S".into()), ..Default::default() }, None);
+        let m = build("https://example.com/a", &Card { title: Some("T".into()), site_name: Some("S".into()), ..Default::default() }, None, None, false);
         let data = m.link_meta.unwrap().data;
         let v = plist::to_value(&RichLink { rich_link_metadata: data, rich_link_is_placeholder: true }).unwrap();
         let archived = rustpush::KeyedArchive::archive_item(v).unwrap();
@@ -418,7 +502,7 @@ mod tests {
 
     #[test]
     fn no_image_means_null() {
-        let m = build("https://example.com", &Card::default(), None);
+        let m = build("https://example.com", &Card::default(), None, None, false);
         let ev = from_meta(m.link_meta.as_ref().unwrap(), "G", None, Json::Null);
         assert!(ev["image"].is_null());
         assert!(ev["sender"].is_null());
@@ -453,6 +537,73 @@ mod tests {
         assert_eq!(absolutize("//cdn.x/i.png", "https://a.com/b"), "https://cdn.x/i.png");
         assert_eq!(absolutize("i.png", "https://a.com/b/c"), "https://a.com/b/i.png");
         assert_eq!(absolutize("i.png", "https://a.com"), "https://a.com/i.png");
+    }
+
+    fn ico(w: u32) -> Vec<u8> {
+        let img = image::RgbaImage::new(w, w);
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Ico).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn image_and_icon_are_separate_attachments() {
+        let img = CardImage::from_bytes(png(40, 20), None).unwrap();
+        let ic = CardImage::from_bytes(png(16, 16), Some("https://e.com/i.png".into())).unwrap();
+        let m = build("https://e.com", &Card::default(), Some(img), Some(ic), false);
+        let lm = m.link_meta.unwrap();
+        assert_eq!(lm.attachments.len(), 2);
+        assert_eq!(lm.attachments[1], png(16, 16));
+        assert_eq!(lm.data.image.as_ref().unwrap().rich_link_image_attachment_substitute_index, 0);
+        assert_eq!(lm.data.icon.as_ref().unwrap().rich_link_image_attachment_substitute_index, 1);
+        assert!(lm.data.image_metadata.is_some());
+        assert_eq!(Into::<String>::into(lm.data.icon_metadata.unwrap().url), "https://e.com/i.png");
+    }
+
+    #[test]
+    fn icon_alone_is_index_zero() {
+        let ic = CardImage::from_bytes(png(16, 16), None).unwrap();
+        let lm = build("https://e.com", &Card::default(), None, Some(ic), false).link_meta.unwrap();
+        assert_eq!(lm.attachments.len(), 1);
+        assert!(lm.data.image.is_none());
+        assert_eq!(lm.data.icon.unwrap().rich_link_image_attachment_substitute_index, 0);
+    }
+
+    #[test]
+    fn compact_moves_lone_image_to_icon() {
+        let img = CardImage::from_bytes(png(40, 20), None).unwrap();
+        let lm = build("https://e.com", &Card::default(), Some(img), None, true).link_meta.unwrap();
+        assert_eq!(lm.attachments.len(), 1);
+        assert!(lm.data.image.is_none() && lm.data.image_metadata.is_none());
+        assert_eq!(lm.data.icon.unwrap().rich_link_image_attachment_substitute_index, 0);
+    }
+
+    #[test]
+    fn compact_with_icon_drops_image() {
+        let img = CardImage::from_bytes(png(40, 20), None).unwrap();
+        let ic = CardImage::from_bytes(png(16, 16), None).unwrap();
+        let lm = build("https://e.com", &Card::default(), Some(img), Some(ic), true).link_meta.unwrap();
+        assert_eq!(lm.attachments.len(), 1);
+        assert!(lm.data.image.is_none());
+        assert_eq!(lm.attachments[0], png(16, 16));
+    }
+
+    #[test]
+    fn icon_links_parsed_in_order() {
+        let html = r#"<link rel="icon" href="/f.png"><link rel="apple-touch-icon" href="/t.png">
+            <link rel="icon" type="image/svg+xml" href="/f.svg"><link rel="stylesheet" href="/s.css">"#;
+        let c = parse_og(html, "https://e.com/a/b");
+        assert_eq!(c.icon_urls, vec!["https://e.com/t.png", "https://e.com/f.png", "https://e.com/favicon.ico"]);
+        assert_eq!(parse_og("", "https://e.com").icon_urls, vec!["https://e.com/favicon.ico"]);
+    }
+
+    #[test]
+    fn ico_becomes_png_svg_refused() {
+        let i = CardImage::icon_from_bytes(ico(32), None).unwrap();
+        assert_eq!(i.mime, "image/png");
+        assert_eq!((i.width, i.height), (32, 32));
+        assert!(CardImage::from_bytes(ico(32), None).is_err());
+        assert!(CardImage::icon_from_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(), None).is_err());
     }
 
     #[test]

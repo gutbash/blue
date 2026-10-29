@@ -278,16 +278,27 @@
 //!
 //!     {"cmd":"send_link","chat":{...},"url":"https://atlas.phila.gov/…",
 //!      "title":"Optional","summary":"Optional","site_name":"Optional",
-//!      "image_path":"C:\\abs\\card.jpg","fetch":true}
+//!      "image_path":"C:\\abs\\card.jpg","icon_path":"C:\\abs\\icon.png",
+//!      "compact":false,"fetch":true}
 //!
 //! Sends a rich link card: rustpush's `NormalMessage.link_meta`, which goes
 //! out as a `com.apple.messages.URLBalloonProvider` balloon carrying an
 //! `LPLinkMetadata`, with the image inline in the balloon (no MMCS). The text
-//! body is the URL. `url` must be absolute http(s). `image_path`: JPEG or PNG.
-//! With `fetch` (default true), a missing title or image is filled from the
-//! page's OpenGraph tags (`og:title`, `og:description`, `og:site_name`,
-//! `og:image`; fallback `<title>` and `description`): 5 s timeout per
-//! request, 512 KB of HTML, 2 MB of image. Given fields always win.
+//! body is the URL. `url` must be absolute http(s). `image_path` (the big
+//! preview image) and `icon_path` (the small icon): JPEG or PNG. Each is its
+//! own attachment in the balloon: image at substitute index 0, icon after it.
+//! `compact` (default false) means no big image: iOS draws the small card
+//! (icon and title on one line). With `compact` and no icon, the image (given
+//! or og:image) is used as the icon, as before; with an icon, the image is
+//! dropped.
+//! With `fetch` (default true), a missing title, image or icon is filled from
+//! the page's OpenGraph tags (`og:title`, `og:description`, `og:site_name`,
+//! `og:image`; fallback `<title>` and `description`) and, for the icon, from
+//! `apple-touch-icon`, then `<link rel="icon">`, then `/favicon.ico` (first
+//! four candidates). An icon must be PNG or JPEG; an ICO is decoded and
+//! re-encoded as PNG (`image` crate `ico` feature); SVG is skipped. 5 s
+//! timeout per request, 512 KB of HTML, 2 MB per image. Given fields always
+//! win.
 //! **Fallback:** with no title and no image, or if the card send fails, the
 //! URL goes as plain text and `card` is false, with the reason in
 //! `card_error`. A card that failed after reaching some devices can arrive
@@ -750,6 +761,13 @@ enum Command {
         /// Fetch the page's OpenGraph tags to fill a missing title or image.
         #[serde(default = "yes")]
         fetch: bool,
+        /// Local JPEG or PNG for the card's small icon.
+        #[serde(default)]
+        icon_path: Option<String>,
+        /// No big image: iOS draws the small card (title and icon on one
+        /// line). With no icon, the image is used as the icon.
+        #[serde(default)]
+        compact: bool,
     },
     /// Write the preview image of a received link card to a file.
     DownloadLinkImage { guid: String, dest: String },
@@ -1322,10 +1340,10 @@ impl Session {
                 Ok(json!({ "path": dest, "bytes": size }))
             }
 
-            Command::SendLink { chat, url, title, summary, site_name, image_path, fetch } => {
+            Command::SendLink { chat, url, title, summary, site_name, image_path, icon_path, fetch, compact } => {
                 link::check_url(&url)?;
                 let (card, card_err) = self
-                    .build_link(&url, title, summary, site_name, image_path, fetch)
+                    .build_link(&url, title, summary, site_name, image_path, icon_path, fetch, compact)
                     .await;
                 let profile = self.profile_for(&chat).await;
                 if let Some(mut m) = card {
@@ -1560,26 +1578,38 @@ impl Session {
         summary: Option<String>,
         site_name: Option<String>,
         image_path: Option<String>,
+        icon_path: Option<String>,
         fetch: bool,
+        compact: bool,
     ) -> (Option<NormalMessage>, Option<String>) {
         let mut notes = Vec::new();
-        let mut card = link::Card { title, summary, site_name, image_url: None };
-        let mut image = None;
-        if let Some(p) = &image_path {
+        let mut card = link::Card { title, summary, site_name, ..Default::default() };
+        let read = |p: &String, notes: &mut Vec<String>, what: &str| {
             match std::fs::read(p).map_err(anyhow::Error::from).and_then(|b| link::CardImage::from_bytes(b, None)) {
-                Ok(i) => image = Some(i),
-                Err(e) => notes.push(format!("image {p}: {e:#}")),
+                Ok(i) => Some(i),
+                Err(e) => { notes.push(format!("{what} {p}: {e:#}")); None }
             }
-        }
-        if fetch && (card.title.is_none() || image.is_none()) {
-            match link::fetch(url).await {
-                Ok((og, og_image)) => {
+        };
+        let mut image = image_path.as_ref().and_then(|p| read(p, &mut notes, "image"));
+        let mut icon = icon_path.as_ref().and_then(|p| read(p, &mut notes, "icon"));
+        // Compact with a given image and no icon: the image is the icon, as
+        // before `icon_path` existed, so there is no icon to look for.
+        let want_icon = icon.is_none() && !(compact && image.is_some());
+        let want_image = image.is_none() && !(compact && icon.is_some());
+        if fetch && (card.title.is_none() || want_image || want_icon) {
+            match link::fetch(url, want_icon).await {
+                Ok(f) => {
+                    let og = f.card;
                     card.title = card.title.or(og.title);
                     card.summary = card.summary.or(og.summary);
                     card.site_name = card.site_name.or(og.site_name);
                     card.image_url = og.image_url.clone();
-                    if image.is_none() {
-                        if let Some(b) = og_image {
+                    if want_icon {
+                        icon = f.icon;
+                    }
+                    // Compact with a site icon found: the og:image is not used.
+                    if image.is_none() && !(compact && icon.is_some()) {
+                        if let Some(b) = f.image {
                             match link::CardImage::from_bytes(b, og.image_url) {
                                 Ok(i) => image = Some(i),
                                 Err(e) => notes.push(format!("og:image: {e:#}")),
@@ -1591,10 +1621,10 @@ impl Session {
             }
         }
         let note = (!notes.is_empty()).then(|| notes.join("; "));
-        if card.title.is_none() && image.is_none() {
+        if card.title.is_none() && image.is_none() && icon.is_none() {
             return (None, Some(note.unwrap_or_else(|| "no title or image to show".into())));
         }
-        (Some(link::build(url, &card, image)), note)
+        (Some(link::build(url, &card, image, icon, compact)), note)
     }
 
     /// A `Read` receipt. iMessage matches a read receipt to a message by the
@@ -2411,7 +2441,8 @@ mod wire_tests {
         assert!(matches!(parse(r#"{"cmd":"poll_vote","chat":{"participants":["tel:+1"]},"poll_guid":"G","option_ids":[]}"#), Command::PollVote { session: None, .. }));
         assert!(matches!(parse(r#"{"cmd":"send","chat":{"participants":["tel:+1"]},"text":"hi","format":[{"start":0,"len":2,"bold":true}],"mentions":[{"start":0,"len":2,"handle":"tel:+1"}],"as_audio_message":false}"#), Command::Send { .. }));
         assert!(matches!(parse(r#"{"cmd":"send_link","chat":{"participants":["tel:+1"]},"url":"https://x.com"}"#), Command::SendLink { fetch: true, title: None, .. }));
-        assert!(matches!(parse(r#"{"cmd":"send_link","chat":{"participants":["tel:+1"]},"url":"https://x.com","title":"T","summary":"S","image_path":"C:\\i.png","fetch":false}"#), Command::SendLink { fetch: false, image_path: Some(_), .. }));
+        assert!(matches!(parse(r#"{"cmd":"send_link","chat":{"participants":["tel:+1"]},"url":"https://x.com","title":"T","summary":"S","image_path":"C:\\i.png","fetch":false}"#), Command::SendLink { fetch: false, image_path: Some(_), icon_path: None, compact: false, .. }));
+        assert!(matches!(parse(r#"{"cmd":"send_link","chat":{"participants":["tel:+1"]},"url":"https://x.com","icon_path":"C:\\c.png","compact":true}"#), Command::SendLink { icon_path: Some(_), compact: true, fetch: true, .. }));
         assert!(matches!(parse(r#"{"cmd":"download_link_image","guid":"G","dest":"C:\\o.jpg"}"#), Command::DownloadLinkImage { .. }));
         assert!(matches!(parse(r#"{"cmd":"focus_status","handles":["tel:+1"]}"#), Command::FocusStatus { .. }));
         assert!(matches!(parse(r#"{"cmd":"focus_status"}"#), Command::FocusStatus { .. }));
