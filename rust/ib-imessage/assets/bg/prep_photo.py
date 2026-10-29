@@ -45,7 +45,10 @@ def main():
     im = Image.open(src)
     im = ImageOps.exif_transpose(im)
     icc = im.info.get("icc_profile")
-    im = im.convert("RGB")
+    # Keep transparency when the source has it, so a transparent design shows the
+    # chat theme through it; flattening to RGB turned every clear pixel black.
+    has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+    im = im.convert("RGBA" if has_alpha else "RGB")
     layer = ImageOps.fit(im, LAYER, Image.LANCZOS, centering=(0.5, 0.5))
     os.makedirs(out, exist_ok=True)
     kw = {"quality": 85}
