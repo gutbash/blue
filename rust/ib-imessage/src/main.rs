@@ -572,6 +572,13 @@ struct ChatRef {
     /// what we want.
     #[serde(default)]
     after_guid: Option<String>,
+    /// Which of our registered handles this message goes out as, for this
+    /// send only. Absent means the default (`--send-as`). Each handle is its
+    /// own member in a group, so this is how one registration speaks as
+    /// several participants. An unregistered handle is refused, never
+    /// silently replaced: the message would otherwise appear from someone else.
+    #[serde(default)]
+    from: Option<String>,
 }
 
 impl From<ChatRef> for ConversationData {
@@ -979,6 +986,20 @@ impl Session {
             .or_else(|| self.handles.first())
             .map(|s| s.as_str())
             .ok_or_else(|| anyhow!("no registered handles — registration has expired"))
+    }
+
+    /// The handle one send goes out as: `from` when given (it must be one of
+    /// ours), else the default.
+    fn sender_handle(&self, from: Option<&str>) -> Result<&str> {
+        match from {
+            None => self.my_handle(),
+            Some(f) => self
+                .handles
+                .iter()
+                .find(|h| h.as_str() == f)
+                .map(|s| s.as_str())
+                .ok_or_else(|| anyhow!("`from` {f} is not one of our registered handles")),
+        }
     }
 
     async fn dispatch(&self, id: Option<String>, cmd: Command) -> Result<Json> {
@@ -1484,12 +1505,13 @@ impl Session {
 
     async fn send(&self, chat: ChatRef, message: Message) -> Result<Json> {
         let _guard = self.send_lock.lock().await;
+        let sender = self.sender_handle(chat.from.as_deref())?.to_string();
         let conversation: ConversationData = chat.into();
         // `IMClient::to_message` doesn't exist for outbound traffic — that
         // helper hangs off `IDSRecvMessage`, for building a reply in the
         // context of something received. Composing fresh means constructing
         // the instance ourselves and naming the handle we're sending as.
-        let mut inst = MessageInst::new(conversation, self.my_handle()?, message);
+        let mut inst = MessageInst::new(conversation, &sender, message);
         // Report the guid before waiting on delivery: the UI wants to show the
         // bubble immediately, and per-recipient delivery is asynchronous.
         let guid = inst.id.clone();
@@ -1724,6 +1746,14 @@ impl Session {
 
     /// The `embedded_profile` for a message to `chat` under `--share-profile`.
     async fn profile_for(&self, chat: &ChatRef) -> Option<rustpush::ShareProfileMessage> {
+        // The share card names the Apple ID, not the address, so an alias
+        // sending as itself (`from`) carries none: it shows as its own
+        // address instead of a second "Group G".
+        if let Some(from) = chat.from.as_deref() {
+            if self.my_handle().ok() != Some(from) {
+                return None;
+            }
+        }
         let guard = self.profile.lock().await;
         let p = guard.as_ref()?;
         match self.share_mode {
