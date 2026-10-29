@@ -186,7 +186,7 @@
 //! `emoji` wins over `kind`. `enable:false` removes the tapback.
 //!
 //! `edit` -> `{"guid","chat_guid"}`:
-//! `{"cmd":"edit","chat":{...},"target_guid":"<guid>","part":0,"text":"new"}`
+//! `{"cmd":"edit","chat":{...},"target_guid":"<guid>","part":0,"text":"new","format":[...]}`
 //!
 //! `unsend` -> `{"guid","chat_guid"}`:
 //! `{"cmd":"unsend","chat":{...},"target_guid":"<guid>","part":0}`
@@ -676,6 +676,9 @@ enum Command {
         #[serde(default)]
         part: u64,
         text: String,
+        /// Formatting ranges over `text`, in UTF-16 code units, as on `send`.
+        #[serde(default)]
+        format: Vec<compose::FormatRange>,
     },
     Unsend {
         chat: ChatRef,
@@ -1164,13 +1167,20 @@ impl Session {
                 target_guid,
                 part,
                 text,
+                format,
             } => {
+                // Formatted runs, as a send builds them; plain text otherwise.
+                let new_parts = if format.is_empty() {
+                    plain_text(&text)
+                } else {
+                    MessageParts(compose::text_parts(&text, &format, &[])?)
+                };
                 self.send(
                     chat,
                     Message::Edit(EditMessage {
                         tuuid: target_guid,
                         edit_part: part,
-                        new_parts: plain_text(&text),
+                        new_parts,
                     }),
                 )
                 .await
