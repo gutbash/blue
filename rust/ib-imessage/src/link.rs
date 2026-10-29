@@ -169,7 +169,10 @@ pub fn build(url: &str, card: &Card, image: Option<CardImage>, icon: Option<Card
     let (image, icon) = match (compact, image, icon) {
         (true, img, None) => (None, img),
         (true, _, ic) => (None, ic),
-        (false, img, ic) => (img, ic),
+        // iOS draws only the small card when an icon is present, so a full card with an
+        // image carries no icon (verified on an iPhone 2026-10-28: the image was dropped).
+        (false, Some(img), _) => (Some(img), None),
+        (false, None, ic) => (None, ic),
     };
     let mut attachments: Vec<Vec<u8>> = Vec::new();
     let mut sub = |img: CardImage| {
@@ -547,17 +550,16 @@ mod tests {
     }
 
     #[test]
-    fn image_and_icon_are_separate_attachments() {
+    fn full_card_with_image_drops_the_icon() {
+        // iOS shows only the small card when an icon is present; the image must win.
         let img = CardImage::from_bytes(png(40, 20), None).unwrap();
         let ic = CardImage::from_bytes(png(16, 16), Some("https://e.com/i.png".into())).unwrap();
         let m = build("https://e.com", &Card::default(), Some(img), Some(ic), false);
         let lm = m.link_meta.unwrap();
-        assert_eq!(lm.attachments.len(), 2);
-        assert_eq!(lm.attachments[1], png(16, 16));
+        assert_eq!(lm.attachments.len(), 1);
         assert_eq!(lm.data.image.as_ref().unwrap().rich_link_image_attachment_substitute_index, 0);
-        assert_eq!(lm.data.icon.as_ref().unwrap().rich_link_image_attachment_substitute_index, 1);
         assert!(lm.data.image_metadata.is_some());
-        assert_eq!(Into::<String>::into(lm.data.icon_metadata.unwrap().url), "https://e.com/i.png");
+        assert!(lm.data.icon.is_none() && lm.data.icon_metadata.is_none());
     }
 
     #[test]
